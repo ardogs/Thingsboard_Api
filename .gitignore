@@ -1,2 +1,13 @@
+# Directorios de caché de Python
+__pycache__/
+
+# Archivos compilados de Python
+*.pyc
+*.pyo
+*.pyd
+*.*.pyc
+Gemini.md
+logs/
 scripts
 venv
+.env
