@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from beanie import init_beanie
@@ -15,6 +16,7 @@ _database_name: Optional[str] = None
 async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_name: Optional[str] = None):
     """
     Inicializa la conexión con MongoDB e inicializa Beanie ODM con los modelos de documentos registrados (TBServer, TBTenant, TBBackup).
+    Detecta automáticamente si el cliente actual pertenece a un event loop cerrado o diferente y lo recrea para evitar errores de 'Event loop is closed'.
     Permite inyectar un cliente personalizado (ej. para pruebas con mongomock_motor).
     """
     global _mongo_client, _database_name
@@ -22,10 +24,28 @@ async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_n
         _database_name = database_name
     
     db_name = _database_name or settings.MONGO_DB_NAME
+    current_loop = asyncio.get_running_loop()
 
+    recreate = False
     if custom_client is not None:
         _mongo_client = custom_client
     elif _mongo_client is None:
+        recreate = True
+    else:
+        # Verificar si el cliente existente está vinculado a un event loop cerrado o distinto
+        try:
+            client_loop = getattr(_mongo_client, "get_io_loop", lambda: None)()
+            if client_loop is None or client_loop.is_closed() or client_loop is not current_loop:
+                recreate = True
+        except Exception:
+            recreate = True
+
+    if recreate:
+        if _mongo_client is not None:
+            try:
+                _mongo_client.close()
+            except Exception:
+                pass
         logger.info(f"[MongoDB] Conectando a {settings.MONGO_URI} (Base de datos: {db_name})...")
         _mongo_client = AsyncIOMotorClient(settings.MONGO_URI)
 

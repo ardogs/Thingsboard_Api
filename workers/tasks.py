@@ -170,6 +170,20 @@ async def _execute_routed_telemetry_download(task_id: str, payload: dict):
             await redis_conn.aclose()
 
 
+def release_server_lock_sync(server_id: Optional[str]):
+    """Libera el candado distribuido de un servidor en Redis de forma síncrona en caso de error fatal."""
+    if not server_id:
+        return
+    try:
+        import redis as sync_redis
+        sr = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+        sr.delete(get_server_lock_key(str(server_id)))
+        sr.close()
+        logger.info(f"[Celery Router] Candado de emergencia liberado para servidor {server_id}.")
+    except Exception as e:
+        logger.warning(f"[Celery Router] Error al liberar candado de emergencia para server {server_id}: {e}")
+
+
 @celery_app.task(bind=True, max_retries=5)
 def download_telemetry_task(self, payload: dict):
     """
@@ -180,6 +194,7 @@ def download_telemetry_task(self, payload: dict):
     tenant_id = payload.get("tenant_id", "unknown_tenant")
     tenant_name = payload.get("tenant_name", "default")
     user_id = str(payload.get("user_id") or "default_user")
+    server_id = payload.get("server_id")
     logger.info(f"[Celery Router] Enrutando tarea {task_id} (TenantID: {tenant_id}, Tenant: {tenant_name})")
 
     try:
@@ -195,6 +210,7 @@ def download_telemetry_task(self, payload: dict):
             raise self.retry(exc=exc, countdown=countdown)
         else:
             logger.error(f"[Celery Router] Error HTTP cliente ({exc.response.status_code}) no recuperable en tarea {task_id}: {exc}")
+            release_server_lock_sync(server_id)
             publish_task_status_sync(
                 user_id=user_id,
                 task_id=task_id,
@@ -205,6 +221,7 @@ def download_telemetry_task(self, payload: dict):
             raise exc
     except Exception as exc:
         logger.error(f"[Celery Router] Error no recuperable en tarea {task_id}: {exc}")
+        release_server_lock_sync(server_id)
         publish_task_status_sync(
             user_id=user_id,
             task_id=task_id,

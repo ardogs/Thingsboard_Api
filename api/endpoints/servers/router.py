@@ -291,6 +291,27 @@ async def get_server_status(
     )
 
 
+@router.post("/{server_id}/unlock")
+async def force_unlock_server(
+    server_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Libera forzadamente el candado distribuido de un servidor ThingsBoard en Redis.
+    Permite recuperar servidores bloqueados tras caídas forzadas o reinicios de servicios.
+    """
+    server = await _resolve_server(server_id, current_user)
+    lock_key = get_server_lock_key(str(server.id))
+    deleted_count = await redis_client.delete(lock_key)
+    was_locked = bool(deleted_count > 0)
+    return {
+        "status": "ok",
+        "server_id": str(server.id),
+        "unlocked": was_locked,
+        "message": f"Candado de '{server.name}' liberado exitosamente" if was_locked else f"El servidor '{server.name}' no tenía ningún candado activo"
+    }
+
+
 # ==========================================
 # Endpoints: CRUD de Tenants (/api/v1/servers/{server_id}/tenants)
 # ==========================================
