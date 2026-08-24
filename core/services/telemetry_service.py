@@ -5,13 +5,16 @@ import shutil
 import asyncio
 import calendar
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import redis.asyncio as redis
+from beanie import PydanticObjectId
 
 from core.config import settings
+from core.models.tb_tenant import TBTenant
+from core.models.tb_backup import TBBackup
 from core.tb_client import ThingsBoardClient
 from core.logger import logger
 
@@ -137,6 +140,8 @@ def get_month_intervals(start_dt: datetime, end_dt: datetime, now_dt: datetime) 
         intervals.append({
             "start_ts": int(current_start.timestamp() * 1000),
             "end_ts": int(period_end.timestamp() * 1000),
+            "start_date_str": current_start.strftime("%Y%m%d"),
+            "end_date_str": period_end.strftime("%Y%m%d"),
             "year_str": year_str,
             "month_str": month_str,
             "state": state
@@ -150,10 +155,86 @@ def get_month_intervals(start_dt: datetime, end_dt: datetime, now_dt: datetime) 
     return intervals
 
 
+async def refresh_tenant_tokens_in_db(
+    tenant_id: Optional[str],
+    tb: ThingsBoardClient,
+    token_ref: list,
+    payload: dict
+) -> Tuple[str, Optional[str]]:
+    """
+    Manejo resiliente de auto-renovación de tokens JWT ante errores HTTP 401 o arranque en frío:
+    a) Intenta renovar el token usando el refresh_token almacenado en el cliente/documento.
+    b) Si el refresh_token expiró o falla, realiza login completo usando username y password de TBTenant.
+    c) Una vez obtenidos los nuevos token y refresh_token, ACTUALIZA asíncronamente el documento TBTenant en MongoDB.
+    d) Actualiza la referencia en memoria para reintentar la petición HTTP sin abortar la tarea.
+    """
+    refresh_token = payload.get("refresh_token") or tb.refresh_token
+    new_token: Optional[str] = None
+    new_refresh_token: Optional[str] = None
+
+    # a) Intentar renovar con refresh_token
+    if refresh_token:
+        logger.warning("[Telemetry Service] HTTP 401 interceptado. Intentando renovación mediante refresh_token...")
+        try:
+            new_tokens = await tb.refresh_jwt_token(refresh_token)
+            new_token = new_tokens.get("token")
+            new_refresh_token = new_tokens.get("refreshToken", refresh_token)
+            logger.info("[Telemetry Service] Token renovado exitosamente con refresh_token.")
+        except Exception as e:
+            logger.warning(f"[Telemetry Service] Falló renovación con refresh_token ({e}). Procediendo con fallback de login...")
+
+    # b) Si refresh_token falló o no existe, hacer login completo con credenciales de Tenant Admin
+    if not new_token and tb.username and tb.password:
+        logger.warning("[Telemetry Service] Ejecutando login completo con credenciales de Tenant Admin...")
+        try:
+            login_res = await tb.login(tb.username, tb.password)
+            if login_res and "token" in login_res:
+                new_token = login_res.get("token")
+                new_refresh_token = login_res.get("refreshToken")
+                logger.info("[Telemetry Service] Re-autenticación exitosa mediante login de credenciales.")
+        except Exception as e:
+            logger.error(f"[Telemetry Service] Falló re-autenticación con credenciales: {e}")
+
+    if not new_token:
+        raise ValueError(
+            f"No se pudo autenticar ni renovar tokens para el Tenant (ID: {tenant_id}) en {tb.base_url}."
+        )
+
+    # Actualizar estado en memoria
+    token_ref[0] = new_token
+    tb.token = new_token
+    if new_refresh_token:
+        tb.refresh_token = new_refresh_token
+        payload["refresh_token"] = new_refresh_token
+    payload["token"] = new_token
+
+    # c) CRÍTICO: Persistir tokens actualizados en MongoDB (TBTenant) de forma asíncrona
+    if tenant_id:
+        try:
+            try:
+                obj_id = PydanticObjectId(tenant_id)
+                tenant_doc = await TBTenant.get(obj_id)
+            except Exception:
+                tenant_doc = await TBTenant.get(tenant_id)
+
+            if tenant_doc:
+                tenant_doc.token = new_token
+                if new_refresh_token:
+                    tenant_doc.refresh_token = new_refresh_token
+                tenant_doc.updated_at = datetime.now(timezone.utc)
+                await tenant_doc.save()
+                logger.info(f"[MongoDB] Documento TBTenant '{tenant_doc.name}' ({tenant_id}) sincronizado en MongoDB con nuevos tokens.")
+        except Exception as e:
+            logger.error(f"[MongoDB] Error actualizando tokens en TBTenant ({tenant_id}): {e}")
+
+    return new_token, new_refresh_token
+
+
 async def download_telemetry_for_key(
     tb: ThingsBoardClient,
     task_id: str,
     user_id: str,
+    tenant_id: Optional[str],
     entity_id: str,
     device_name: str,
     key: str,
@@ -181,12 +262,22 @@ async def download_telemetry_for_key(
             force_reload = payload.get("force_reload", False)
             cache_key = f"tb_backup:{tenant_name}:{entity_id}:{key}:{year_str}_{month_str}:last_ts"
 
-            # Checkpoint: Resume from last saved timestamp unless force_reload is True
+            # Checkpoint: Reanudar desde el último timestamp guardado si es válido y está dentro del rango solicitado
             if force_reload:
                 current_ts = start_ts
             else:
                 last_saved_ts = await local_redis.get(cache_key)
-                current_ts = int(last_saved_ts) if last_saved_ts else start_ts
+                if last_saved_ts:
+                    try:
+                        parsed_ts = int(last_saved_ts)
+                        if start_ts <= parsed_ts < end_ts:
+                            current_ts = parsed_ts
+                        else:
+                            current_ts = start_ts
+                    except (ValueError, TypeError):
+                        current_ts = start_ts
+                else:
+                    current_ts = start_ts
 
             month_records = []
 
@@ -206,6 +297,8 @@ async def download_telemetry_for_key(
                 total_records=total_recs
             )
 
+            logger.info(f"[{device_name}] Consultando telemetría para '{key}' en rango [{current_ts} -> {end_ts}] ({month_str}-{year_str})")
+
             while current_ts < end_ts:
                 try:
                     data = await tb.get_entity_telemetry(
@@ -218,16 +311,17 @@ async def download_telemetry_for_key(
                         limit=page_limit
                     )
                 except httpx.HTTPStatusError as e:
-                    refresh_token = payload.get("refresh_token") or payload.get("REFRESH_TOKEN") or tb.refresh_token
-                    if e.response.status_code == 401 and refresh_token:
-                        logger.warning("Token expirado (401). Renovando mediante refresh token...")
-                        new_tokens = await tb.refresh_jwt_token(refresh_token)
-                        token_ref[0] = new_tokens["token"]
-                        if "refresh_token" in payload:
-                            payload["refresh_token"] = new_tokens["refreshToken"]
+                    if e.response.status_code == 401:
+                        logger.warning(f"[Telemetry Key] 401 detectado al descargar '{key}'. Ejecutando auto-renovación en vuelo...")
+                        await refresh_tenant_tokens_in_db(
+                            tenant_id=tenant_id,
+                            tb=tb,
+                            token_ref=token_ref,
+                            payload=payload
+                        )
                         continue
                     elif e.response.status_code in (500, 502, 503, 504):
-                        logger.error(f"Error del servidor de ThingsBoard: {e.response.status_code}. Delegando a Celery Retry.")
+                        logger.error(f"Error del servidor ThingsBoard: {e.response.status_code}. Delegando a Celery Retry.")
                         raise
                     else:
                         raise
@@ -235,15 +329,32 @@ async def download_telemetry_for_key(
                     logger.error(f"Error de red: {str(e)}. Delegando a Celery Retry.")
                     raise
 
-                if not data or key not in data or len(data[key]) == 0:
+                records = []
+                if data:
+                    if key in data and isinstance(data[key], list):
+                        records = data[key]
+                    else:
+                        for k, v in data.items():
+                            if k.lower() == key.lower() and isinstance(v, list):
+                                records = v
+                                break
+                        if not records and len(data) == 1:
+                            first_val = list(data.values())[0]
+                            if isinstance(first_val, list):
+                                records = first_val
+
+                if not records:
+                    logger.info(f"[{device_name}] Sin más registros para '{key}' a partir de ts={current_ts}")
                     break
 
-                records = data[key]
+                # Asegurar orden cronológico ascendente
+                records = sorted(records, key=lambda x: x.get("ts", 0))
                 month_records.extend(records)
 
                 # Actualizar checkpoint
                 last_record_ts = records[-1]["ts"]
-                current_ts = last_record_ts + 1
+                next_ts = max(current_ts + 1, last_record_ts + 1)
+                current_ts = next_ts
                 await local_redis.set(cache_key, str(current_ts))
 
                 async with progress_lock:
@@ -266,25 +377,28 @@ async def download_telemetry_for_key(
                     break
 
             if month_records:
-                dir_path = f"backups/{tenant_name}/{device_name}/{year_str}/{month_str}"
+                dir_path = os.path.join("backups", f"tmp_{task_id}", tenant_name, device_name, year_str, month_str)
                 os.makedirs(dir_path, exist_ok=True)
 
                 if state == "completo":
-                    old_partial_1 = os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}_parcial.json")
-                    old_partial_2 = os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}.parcial.json")
-                    if os.path.exists(old_partial_1):
-                        os.remove(old_partial_1)
-                    if os.path.exists(old_partial_2):
-                        os.remove(old_partial_2)
+                    old_candidates = [
+                        os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}.parcial.json"),
+                        os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}_parcial.json"),
+                    ]
+                    for old_file in old_candidates:
+                        if os.path.exists(old_file):
+                            try:
+                                os.remove(old_file)
+                            except Exception:
+                                pass
 
-                file_name = f"{entity_id}.{safe_key}.{month_str}-{year_str}_{state}.json"
+                file_name = f"{entity_id}.{safe_key}.{month_str}-{year_str}.{state}.json"
                 file_path = os.path.join(dir_path, file_name)
 
                 records_in_file = len(month_records)
                 output_content = {
                     "data": month_records,
-                    "length": records_in_file,
-                    "records_count": records_in_file
+                    "length": records_in_file
                 }
 
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -326,19 +440,29 @@ async def run_download_orchestrator(
     payload: dict
 ):
     """
-    Orquestador asíncrono principal de descarga masiva de telemetría.
-    Ejecuta el descubrimiento de dispositivos, particionado de fechas, paginación por marcas de tiempo y empaquetado ZIP.
+    Orquestador asíncrono principal de descarga masiva de telemetría Multi-Tenant.
+    Ejecuta el descubrimiento de dispositivos, particionado de fechas, paginación continua,
+    auto-renovación de tokens con persistencia en MongoDB y compresión final en archivo ZIP.
     """
-    token = payload.get("token") or tb.token
-    refresh_token = payload.get("refresh_token") or tb.refresh_token
-    tenant_name = sanitize_name(payload.get("tenant_name") or payload.get("TENANT_NAME", "default"))
-    time_zone_str = payload.get("time_zone") or payload.get("TIME_ZONE", "UTC")
-    start_date_str = payload.get("start_date") or payload.get("START_DATE")
-    end_date_str = payload.get("end_date") or payload.get("END_DATE")
-    entity_type = payload.get("entity_type") or payload.get("ENTITY_TYPE", "DEVICE")
-    concurrency_limit = payload.get("concurrency_limit") or payload.get("config", {}).get("concurrency_limit", 3)
+    tenant_id = payload.get("tenant_id")
+    token = tb.token
+    tenant_name = sanitize_name(payload.get("tenant_name") or "default")
+    time_zone_str = payload.get("time_zone") or "UTC"
+    start_date_str = payload.get("start_date")
+    end_date_str = payload.get("end_date")
+    entity_type = payload.get("entity_type") or "DEVICE"
+    concurrency_limit = payload.get("concurrency_limit") or 3
 
-    token_ref = [token]
+    token_ref = [token or ""]
+
+    # Validación de arranque en frío si la instancia no tiene token
+    if not token_ref[0]:
+        await refresh_tenant_tokens_in_db(
+            tenant_id=tenant_id,
+            tb=tb,
+            token_ref=token_ref,
+            payload=payload
+        )
 
     tz = ZoneInfo(time_zone_str)
     now_dt = datetime.now(tz)
@@ -365,14 +489,21 @@ async def run_download_orchestrator(
             total_records=0
         )
 
+        placeholder_values = {"string", "null", "none", "undefined", "", "{}", "[]"}
         raw_entity_id = payload.get("entity_id")
         entity_ids = []
         if isinstance(raw_entity_id, list):
-            entity_ids = [str(x).strip() for x in raw_entity_id if str(x).strip()]
+            entity_ids = [
+                str(x).strip() for x in raw_entity_id 
+                if str(x).strip() and str(x).strip().lower() not in placeholder_values
+            ]
         elif isinstance(raw_entity_id, str) and raw_entity_id.strip():
             if "," in raw_entity_id:
-                entity_ids = [x.strip() for x in raw_entity_id.split(",") if x.strip()]
-            else:
+                entity_ids = [
+                    x.strip() for x in raw_entity_id.split(",") 
+                    if x.strip() and x.strip().lower() not in placeholder_values
+                ]
+            elif raw_entity_id.strip().lower() not in placeholder_values:
                 entity_ids = [raw_entity_id.strip()]
 
         if entity_ids:
@@ -382,22 +513,45 @@ async def run_download_orchestrator(
                     dev_info = await tb.get_device_by_id(token=token_ref[0], device_id=eid)
                     if dev_info and "name" in dev_info:
                         dev_name = dev_info["name"]
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401:
+                        await refresh_tenant_tokens_in_db(
+                            tenant_id=tenant_id,
+                            tb=tb,
+                            token_ref=token_ref,
+                            payload=payload
+                        )
+                        dev_info = await tb.get_device_by_id(token=token_ref[0], device_id=eid)
+                        if dev_info and "name" in dev_info:
+                            dev_name = dev_info["name"]
+                    elif e.response.status_code in (400, 404):
+                        raise ValueError(
+                            f"El dispositivo con ID '{eid}' no existe o el formato del UUID es inválido en ThingsBoard (HTTP {e.response.status_code})."
+                        )
+                    else:
+                        raise
                 except Exception as e:
+                    if isinstance(e, ValueError):
+                        raise
                     logger.warning(f"No se pudo consultar el nombre del dispositivo {eid}: {e}")
                 devices_info.append((eid, sanitize_name(dev_name)))
         else:
-            # Obtener todos los dispositivos del tenant
+            # Obtener todos los dispositivos del tenant con paginación y manejo de 401
             page = 0
             while True:
                 try:
                     res = await tb.get_tenant_devices(token=token_ref[0], limit=100, page=page)
                 except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 401 and refresh_token:
-                        logger.warning("Token expirado (401). Renovando mediante refresh token...")
-                        new_tokens = await tb.refresh_jwt_token(refresh_token)
-                        token_ref[0] = new_tokens["token"]
-                        continue
-                    raise
+                    if e.response.status_code == 401:
+                        await refresh_tenant_tokens_in_db(
+                            tenant_id=tenant_id,
+                            tb=tb,
+                            token_ref=token_ref,
+                            payload=payload
+                        )
+                        res = await tb.get_tenant_devices(token=token_ref[0], limit=100, page=page)
+                    else:
+                        raise
 
                 devices = res.get("data", [])
                 if not devices:
@@ -410,6 +564,10 @@ async def run_download_orchestrator(
                     break
                 page += 1
 
+        logger.info(f"[Discovery] Total de dispositivos identificados para Tenant '{tenant_name}': {len(devices_info)}")
+        if not devices_info:
+            logger.warning(f"[Discovery] No se encontraron dispositivos disponibles para el Tenant '{tenant_name}' en ThingsBoard.")
+
         sem = asyncio.Semaphore(concurrency_limit)
         work_items = []
 
@@ -417,18 +575,27 @@ async def run_download_orchestrator(
             try:
                 keys = await tb.get_entity_timeseries_keys(token=token_ref[0], entity_type=entity_type, entity_id=eid)
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 401 and refresh_token:
-                    logger.warning("Token expirado (401). Renovando mediante refresh token...")
-                    new_tokens = await tb.refresh_jwt_token(refresh_token)
-                    token_ref[0] = new_tokens["token"]
+                if e.response.status_code == 401:
+                    await refresh_tenant_tokens_in_db(
+                        tenant_id=tenant_id,
+                        tb=tb,
+                        token_ref=token_ref,
+                        payload=payload
+                    )
                     keys = await tb.get_entity_timeseries_keys(token=token_ref[0], entity_type=entity_type, entity_id=eid)
+                elif e.response.status_code in (400, 404):
+                    logger.warning(f"[Discovery] No se pudieron obtener llaves para '{d_name}' ({eid}): HTTP {e.response.status_code}")
+                    keys = []
                 else:
                     raise
 
+            logger.info(f"[Discovery] Dispositivo '{d_name}' ({eid}) reporta {len(keys)} llaves de telemetría: {keys}")
             for key in keys:
                 work_items.append((eid, d_name, key))
 
         total_units = len(work_items) * len(intervals)
+        logger.info(f"[Orquestador] Total de unidades de trabajo a procesar: {total_units} (Items: {len(work_items)}, Intervalos: {len(intervals)})")
+
         progress_tracker = {
             "total_units": max(total_units, 1),
             "completed_units": 0,
@@ -455,6 +622,7 @@ async def run_download_orchestrator(
                 tb=tb,
                 task_id=task_id,
                 user_id=user_id,
+                tenant_id=tenant_id,
                 entity_id=eid,
                 device_name=d_name,
                 key=key,
@@ -492,19 +660,70 @@ async def run_download_orchestrator(
             total_records=final_total_records
         )
 
-        dir_to_zip = f"backups/{tenant_name}"
-        zip_filename = f"backups/{task_id}_{tenant_name}.zip"
+        start_fmt = start_dt.strftime("%Y%m%d")
+        end_fmt = end_dt.strftime("%Y%m%d")
+        zip_filename_only = f"{tenant_name}_{start_fmt}_to_{end_fmt}_{task_id}.zip"
+        zip_base_name = f"{tenant_name}_{start_fmt}_to_{end_fmt}_{task_id}"
+        zip_file_path = os.path.join("backups", zip_filename_only)
 
-        if os.path.exists(dir_to_zip):
-            shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', dir_to_zip)
-            logger.info(f"Empaquetado exitoso: {zip_filename}")
-            try:
-                shutil.rmtree(dir_to_zip)
-                logger.info(f"Carpeta original eliminada tras compresión: {dir_to_zip}")
-            except Exception as e:
-                logger.warning(f"No se pudo eliminar la carpeta original {dir_to_zip}: {e}")
+        os.makedirs("backups", exist_ok=True)
+        tmp_task_dir = os.path.join("backups", f"tmp_{task_id}")
+        tenant_dir_in_tmp = os.path.join(tmp_task_dir, tenant_name)
+
+        if os.path.exists(tenant_dir_in_tmp):
+            shutil.make_archive(
+                base_name=os.path.join("backups", zip_base_name),
+                format="zip",
+                root_dir=tmp_task_dir,
+                base_dir=tenant_name
+            )
+            logger.info(f"Empaquetado exitoso: {zip_file_path}")
+        elif os.path.exists(tmp_task_dir):
+            shutil.make_archive(
+                base_name=os.path.join("backups", zip_base_name),
+                format="zip",
+                root_dir=tmp_task_dir
+            )
+            logger.info(f"Empaquetado exitoso: {zip_file_path}")
         else:
-            logger.warning(f"No hay datos para empaquetar para el tenant {tenant_name}")
+            logger.warning(f"No hay datos para empaquetar para el tenant {tenant_name} (tarea {task_id})")
+
+        # Eliminar completamente la carpeta temporal tmp_{task_id} para liberar espacio
+        if os.path.exists(tmp_task_dir):
+            try:
+                shutil.rmtree(tmp_task_dir, ignore_errors=True)
+                logger.info(f"Carpeta temporal de trabajo eliminada tras compresión: {tmp_task_dir}")
+            except Exception as e:
+                logger.warning(f"No se pudo eliminar la carpeta temporal {tmp_task_dir}: {e}")
+
+        # Registrar el respaldo en el Catálogo de Respaldos de MongoDB (TBBackup)
+        file_size = os.path.getsize(zip_file_path) if os.path.exists(zip_file_path) else 0
+        tenant_doc = None
+        if tenant_id:
+            try:
+                obj_id = PydanticObjectId(tenant_id)
+                tenant_doc = await TBTenant.get(obj_id)
+            except Exception:
+                tenant_doc = await TBTenant.get(tenant_id)
+
+        if tenant_doc:
+            try:
+                backup_record = TBBackup(
+                    tenant_id=tenant_doc,
+                    task_id=task_id,
+                    requested_by=user_id,
+                    file_name=zip_filename_only,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    file_size_bytes=file_size,
+                    created_at=datetime.now(timezone.utc)
+                )
+                await backup_record.insert()
+                logger.info(f"[MongoDB] Catálogo de respaldos: Documento TBBackup guardado exitosamente para tarea {task_id} (Archivo: {zip_filename_only}, Tamaño: {file_size} bytes)")
+            except Exception as e:
+                logger.error(f"[MongoDB] Error guardando documento TBBackup en base de datos para tarea {task_id}: {e}")
+        else:
+            logger.warning(f"[MongoDB] No se encontró el documento TBTenant para el ID '{tenant_id}'. TBBackup no registrado.")
 
         logger.info(f"Tarea {task_id} finalizada exitosamente para {tenant_name} (user {user_id}). Total de registros: {final_total_records}")
 
