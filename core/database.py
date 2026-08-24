@@ -4,22 +4,28 @@ from beanie import init_beanie
 
 from core.config import settings
 from core.models.tb_server import TBServer
+from core.models.tb_tenant import TBTenant
+from core.models.tb_backup import TBBackup
 from core.logger import logger
 
 _mongo_client: Optional[AsyncIOMotorClient] = None
+_database_name: Optional[str] = None
 
 
 async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_name: Optional[str] = None):
     """
-    Inicializa la conexión con MongoDB e inicializa Beanie ODM con los modelos de documentos registrados.
+    Inicializa la conexión con MongoDB e inicializa Beanie ODM con los modelos de documentos registrados (TBServer, TBTenant, TBBackup).
     Permite inyectar un cliente personalizado (ej. para pruebas con mongomock_motor).
     """
-    global _mongo_client
-    db_name = database_name or settings.MONGO_DB_NAME
+    global _mongo_client, _database_name
+    if database_name is not None:
+        _database_name = database_name
+    
+    db_name = _database_name or settings.MONGO_DB_NAME
 
     if custom_client is not None:
         _mongo_client = custom_client
-    else:
+    elif _mongo_client is None:
         logger.info(f"[MongoDB] Conectando a {settings.MONGO_URI} (Base de datos: {db_name})...")
         _mongo_client = AsyncIOMotorClient(settings.MONGO_URI)
 
@@ -28,10 +34,12 @@ async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_n
     await init_beanie(
         database=database,
         document_models=[
-            TBServer
+            TBServer,
+            TBTenant,
+            TBBackup
         ]
     )
-    logger.info("[MongoDB] Beanie ODM inicializado exitosamente con el modelo TBServer.")
+    logger.info("[MongoDB] Beanie ODM inicializado exitosamente con los modelos TBServer, TBTenant y TBBackup.")
 
 
 async def close_db():

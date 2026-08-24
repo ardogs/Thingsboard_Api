@@ -1,13 +1,11 @@
-# Directorios de caché de Python
 __pycache__/
-
-# Archivos compilados de Python
 *.pyc
 *.pyo
 *.pyd
 *.*.pyc
-Gemini.md
 logs/*
+backups/*
+!backups/.gitkeep
 scripts
 venv
 .env

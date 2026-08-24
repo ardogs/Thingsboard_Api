@@ -2,42 +2,62 @@ import os
 import json
 import asyncio
 from datetime import datetime
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Any
 
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, HTTPException, Request, Depends, status
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import redis.asyncio as redis
 from beanie import PydanticObjectId
 
-from core.models.tb_server import TBServer
-from core.tb_client import ThingsBoardClient
+from core.models.tb_tenant import TBTenant
+from core.models.tb_backup import TBBackup
 from core.config import settings
 from core.logger import logger
+from core.redis_client import redis_client
 from api.deps import User, get_current_user
 from workers.tasks import (
     download_telemetry_task,
     get_user_stream_channel,
-    get_user_registry_key
+    get_user_registry_key,
+    get_server_lock_key
 )
 
 router = APIRouter()
 
 
 class DownloadTelemetryRequest(BaseModel):
-    server_id: Optional[str] = Field(default=None, description="ID del servidor ThingsBoard registrado en MongoDB")
-    server_url: Optional[str] = Field(default=None, description="URL directa (opcional si se usa server_id)")
+    tenant_id: str = Field(..., description="ID de MongoDB del documento TBTenant")
     start_date: str = Field(..., description="Fecha inicial ISO (ej: 2026-01-01T00:00:00)")
     end_date: str = Field(..., description="Fecha final ISO (ej: 2026-08-01T23:59:59)")
-    token: Optional[str] = Field(default=None, description="Token JWT de ThingsBoard (opcional si el servidor ya lo tiene)")
-    tenant_name: str = "default"
-    refresh_token: Optional[str] = None
-    entity_type: str = "DEVICE"
-    entity_id: Optional[Union[str, List[str]]] = None
-    time_zone: str = "UTC"
-    concurrency_limit: int = 3
-    page_limit: int = 2000
-    force_reload: bool = False
+    entity_type: str = Field(default="DEVICE", description="Tipo de entidad en ThingsBoard (DEVICE, ASSET)")
+    entity_id: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        description="UUID o lista de UUIDs de dispositivos específicos. Dejar en null para descargar todos los dispositivos del Tenant."
+    )
+    time_zone: str = Field(default="UTC", description="Zona horaria (ej: America/Mexico_City)")
+    concurrency_limit: int = Field(default=3, description="Límite de concurrencia de descarga simultánea")
+    page_limit: int = Field(default=2000, description="Tamaño de página por petición de telemetría")
+    force_reload: bool = Field(default=False, description="Sobrescribir checkpoints previos e iniciar desde cero")
+
+    @field_validator("entity_id", mode="before")
+    @classmethod
+    def sanitize_entity_id(cls, v: Any) -> Optional[Union[str, List[str]]]:
+        if v is None:
+            return None
+        placeholder_values = {"string", "null", "none", "undefined", "", "{}", "[]"}
+        if isinstance(v, str):
+            clean_v = v.strip()
+            if clean_v.lower() in placeholder_values:
+                return None
+            return clean_v
+        if isinstance(v, list):
+            cleaned_list = [
+                str(item).strip() for item in v
+                if str(item).strip() and str(item).strip().lower() not in placeholder_values
+            ]
+            return cleaned_list if cleaned_list else None
+        return v
 
 
 class ActiveTaskResponse(BaseModel):
@@ -52,81 +72,101 @@ class ActiveTaskResponse(BaseModel):
     records_count: Optional[int] = None
 
 
-@router.post("/download")
+class BackupResponse(BaseModel):
+    id: str = Field(..., description="ID del documento de respaldo en MongoDB")
+    tenant_id: str = Field(..., description="ID del Tenant respaldado")
+    tenant_name: Optional[str] = Field(default=None, description="Nombre del Tenant")
+    task_id: str = Field(..., description="ID de la tarea de Celery")
+    requested_by: str = Field(..., description="ID del usuario que solicitó el respaldo")
+    file_name: str = Field(..., description="Nombre del archivo ZIP generado")
+    start_date: datetime = Field(..., description="Fecha de inicio del rango de telemetría")
+    end_date: datetime = Field(..., description="Fecha de fin del rango de telemetría")
+    file_size_bytes: int = Field(default=0, description="Tamaño del archivo ZIP en bytes")
+    created_at: datetime = Field(..., description="Fecha y hora de creación del respaldo")
+    download_url: str = Field(..., description="URL para la descarga directa del archivo ZIP")
+
+
+@router.post("/download", status_code=status.HTTP_200_OK)
 async def download_telemetry(
     request: DownloadTelemetryRequest,
-    current_user: User = Depends(get_current_user),
-    authorization: Optional[str] = None,
-    x_authorization: Optional[str] = None
+    current_user: User = Depends(get_current_user)
 ):
     """
-    Inicia una tarea asíncrona de descarga de telemetría sobre un servidor ThingsBoard registrado en MongoDB o URL directa.
+    Inicia una tarea asíncrona de descarga masiva de telemetría para un Tenant registrado en MongoDB.
+    Valida la existencia del Tenant y el aislamiento por usuario antes de encolar en Celery.
+    Aplica Rechazo Temprano (Fail Fast / Distributed Lock) si el servidor ThingsBoard se encuentra ocupado.
+    El cliente se comunica exclusivamente mediante el JWT del API Gateway, sin necesidad de enviar tokens de ThingsBoard.
     """
-    target_base_url = request.server_url
-    target_token = request.token
+    # 1. Validar existencia del Tenant en MongoDB usando Beanie
+    try:
+        obj_id = PydanticObjectId(request.tenant_id)
+        tenant_doc = await TBTenant.get(obj_id)
+    except Exception:
+        tenant_doc = await TBTenant.get(request.tenant_id)
 
-    if not target_token:
-        auth_header = x_authorization or authorization
-        if auth_header:
-            target_token = auth_header.replace("Bearer ", "").strip()
-
-    # Si se especificó server_id, resolver desde MongoDB
-    if request.server_id:
-        try:
-            try:
-                obj_id = PydanticObjectId(request.server_id)
-                server = await TBServer.get(obj_id)
-            except Exception:
-                server = await TBServer.get(request.server_id)
-        except Exception:
-            server = None
-
-        if not server:
-            raise HTTPException(status_code=404, detail=f"Servidor ThingsBoard con ID '{request.server_id}' no encontrado en MongoDB")
-
-        if current_user.role != "admin" and server.user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="No tienes permisos para usar este servidor ThingsBoard")
-
-        target_base_url = server.base_url
-        if not target_token:
-            target_token = server.token
-
-    if not target_base_url:
+    if not tenant_doc:
         raise HTTPException(
-            status_code=400,
-            detail="Debes proporcionar 'server_id' (MongoDB) o 'server_url'"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant de ThingsBoard con ID '{request.tenant_id}' no encontrado en MongoDB"
         )
 
-    if not target_token:
+    # 2. Validar aislamiento y permisos de usuario
+    if current_user.role != "admin" and tenant_doc.user_id != current_user.id:
         raise HTTPException(
-            status_code=400,
-            detail="Se requiere el token de ThingsBoard (en el servidor registrado, body 'token' o header 'Authorization')"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes permisos para iniciar descargas en este Tenant"
         )
 
-    # Validar token contra el servidor ThingsBoard dinámico
-    tb = ThingsBoardClient(base_url=target_base_url)
-    is_valid = await tb.verify_token(target_token)
-
-    if not is_valid:
+    # 3. Resolver servidor ThingsBoard padre
+    server_doc = await tenant_doc.get_server()
+    if not server_doc:
         raise HTTPException(
-            status_code=401,
-            detail=f"El token de ThingsBoard ha expirado o es inválido en el servidor {target_base_url}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"El servidor ThingsBoard asociado al Tenant '{tenant_doc.name}' no existe o fue eliminado"
         )
 
-    task_payload = request.model_dump()
-    task_payload["token"] = target_token
-    task_payload["server_url"] = target_base_url
-    task_payload["user_id"] = current_user.id
+    # 4. Adquisición Atómica del Candado Distribuido (Fail Fast / Prevención TOCTOU)
+    server_id = str(server_doc.id)
+    lock_key = get_server_lock_key(server_id)
+    lock_acquired = await redis_client.set(lock_key, "locked", nx=True, ex=300)
+    if not lock_acquired:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El servidor ThingsBoard se encuentra actualmente ocupado procesando otro respaldo. Por favor, intente más tarde."
+        )
 
-    # Encolar tarea en Celery a través del enrutador
-    task = download_telemetry_task.delay(task_payload)
+    # 5. Preparar payload desacoplado para el Celery Worker
+    task_payload = {
+        "tenant_id": str(tenant_doc.id),
+        "tenant_name": tenant_doc.name,
+        "server_id": server_id,
+        "server_url": server_doc.base_url,
+        "start_date": request.start_date,
+        "end_date": request.end_date,
+        "entity_type": request.entity_type,
+        "entity_id": request.entity_id,
+        "time_zone": request.time_zone,
+        "concurrency_limit": request.concurrency_limit,
+        "page_limit": request.page_limit,
+        "force_reload": request.force_reload,
+        "user_id": current_user.id
+    }
+
+    # 6. Encolar la tarea en Celery de forma completamente asíncrona y no bloqueante
+    try:
+        task = download_telemetry_task.delay(task_payload)
+    except Exception as e:
+        await redis_client.delete(lock_key)
+        raise e
 
     return {
         "task_id": task.id,
         "status": "Task enqueued",
         "user_id": current_user.id,
-        "server_id": request.server_id,
-        "server_url": target_base_url
+        "tenant_id": str(tenant_doc.id),
+        "tenant_name": tenant_doc.name,
+        "server_id": server_id,
+        "server_url": server_doc.base_url
     }
 
 
@@ -238,20 +278,105 @@ async def stream_task_progress(
     )
 
 
+@router.get("/backups", response_model=List[BackupResponse], status_code=status.HTTP_200_OK)
+async def list_tenant_backups(
+    tenant_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Lista el historial de respaldos de telemetría disponibles en MongoDB para un Tenant específico.
+    Permite el acceso a administradores o usuarios con permisos sobre dicho Tenant.
+    """
+    # 1. Validar existencia del Tenant
+    try:
+        obj_id = PydanticObjectId(tenant_id)
+        tenant_doc = await TBTenant.get(obj_id)
+    except Exception:
+        tenant_doc = await TBTenant.get(tenant_id)
+
+    if not tenant_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant de ThingsBoard con ID '{tenant_id}' no encontrado en MongoDB"
+        )
+
+    # 2. Validar permisos de acceso al Tenant
+    if current_user.role != "admin" and tenant_doc.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes permisos para consultar los respaldos de este Tenant"
+        )
+
+    # 3. Consultar documentos TBBackup asociados al Tenant
+    ref = tenant_doc.to_ref()
+    backups = await TBBackup.find(
+        {"$or": [{"tenant_id": ref}, {"tenant_id.$id": tenant_doc.id}, {"tenant_id": tenant_doc.id}]}
+    ).sort("-created_at").to_list()
+
+    results: List[BackupResponse] = []
+    for b in backups:
+        results.append(
+            BackupResponse(
+                id=str(b.id),
+                tenant_id=str(tenant_doc.id),
+                tenant_name=tenant_doc.name,
+                task_id=b.task_id,
+                requested_by=b.requested_by,
+                file_name=b.file_name,
+                start_date=b.start_date,
+                end_date=b.end_date,
+                file_size_bytes=b.file_size_bytes,
+                created_at=b.created_at,
+                download_url=f"/api/v1/telemetry/download/file/{b.task_id}"
+            )
+        )
+
+    return results
+
+
 @router.get("/download/file/{task_id}")
 async def download_file(
     task_id: str,
     current_user: User = Depends(get_current_user)
 ):
     """
-    Permite a cualquier usuario autenticado descargar el archivo ZIP respaldado en la carpeta común 'backups/'.
+    Permite descargar el archivo ZIP respaldado consultando el catálogo TBBackup en MongoDB.
+    Valida permisos de acceso al Tenant asociado antes de servir el archivo.
     """
     backup_dir = "backups"
     if not os.path.exists(backup_dir):
-        raise HTTPException(status_code=404, detail="El directorio de backups no existe")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El directorio de backups no existe"
+        )
 
+    # 1. Consultar el documento TBBackup en MongoDB
+    backup_doc = None
+    try:
+        backup_doc = await TBBackup.find_one({"task_id": task_id})
+    except Exception as e:
+        logger.warning(f"[Download File] No se pudo consultar TBBackup para task {task_id}: {e}")
+
+    if backup_doc:
+        tenant_doc = await backup_doc.get_tenant()
+        if current_user.role != "admin" and backup_doc.requested_by != current_user.id:
+            if tenant_doc and tenant_doc.user_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No tienes permisos para descargar este respaldo"
+                )
+
+        file_path = os.path.join(backup_dir, backup_doc.file_name)
+        if os.path.exists(file_path):
+            return FileResponse(
+                path=file_path,
+                media_type="application/zip",
+                filename=backup_doc.file_name
+            )
+
+    # 2. Fallback de compatibilidad si el archivo existe en disco
     for filename in os.listdir(backup_dir):
-        if filename.startswith(f"{task_id}_") and filename.endswith(".zip"):
+        if (filename.startswith(f"{task_id}_") or filename.endswith(f"_{task_id}.zip")) and filename.endswith(".zip"):
             file_path = os.path.join(backup_dir, filename)
             return FileResponse(
                 path=file_path,
@@ -260,7 +385,7 @@ async def download_file(
             )
 
     raise HTTPException(
-        status_code=404,
+        status_code=status.HTTP_404_NOT_FOUND,
         detail="El archivo de backup no existe o no ha terminado de procesarse"
     )
 

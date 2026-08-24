@@ -1,9 +1,10 @@
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field
 from beanie import PydanticObjectId
 
 from core.models.tb_server import TBServer
+from core.models.tb_tenant import TBTenant
 from core.tb_client import ThingsBoardClient
 from api.deps import User, get_current_user
 
@@ -20,18 +21,14 @@ class DeviceProvisionRequest(BaseModel):
 class DeviceProvisionBatchRequest(BaseModel):
     devices: List[DeviceProvisionRequest]
     device_profile_id: Optional[str] = None
+    tenant_id: Optional[str] = None
 
 
-@router.get("/{server_id}")
-async def list_server_devices(
+async def _resolve_server_and_tenant(
     server_id: str,
-    limit: int = 100,
-    page: int = 0,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Lista dispositivos desde una instancia ThingsBoard registrada en MongoDB.
-    """
+    tenant_id: Optional[str],
+    current_user: User
+) -> tuple[TBServer, TBTenant]:
     try:
         obj_id = PydanticObjectId(server_id)
         server = await TBServer.get(obj_id)
@@ -44,12 +41,73 @@ async def list_server_devices(
     if current_user.role != "admin" and server.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="No tienes permisos para este servidor")
 
-    if not server.token:
-        raise HTTPException(status_code=400, detail="El servidor no tiene un token JWT configurado")
+    # Si se especificó tenant_id, buscar ese tenant específico
+    tenant: Optional[TBTenant] = None
+    if tenant_id:
+        try:
+            t_id = PydanticObjectId(tenant_id)
+            tenant = await TBTenant.get(t_id)
+        except Exception:
+            tenant = await TBTenant.get(tenant_id)
 
-    client = ThingsBoardClient(base_url=server.base_url, token=server.token, refresh_token=server.refresh_token)
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant especificado no encontrado")
+        if current_user.role != "admin" and tenant.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="No tienes permisos para este tenant")
+    else:
+        # Obtener el primer tenant disponible del usuario bajo este servidor
+        if current_user.role == "admin":
+            tenant = await TBTenant.find_one(TBTenant.server_id == server.to_ref())
+        else:
+            tenant = await TBTenant.find_one(
+                TBTenant.server_id == server.to_ref(),
+                TBTenant.user_id == current_user.id
+            )
+
+    if not tenant:
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontró ningún Tenant registrado bajo este servidor. Registra un Tenant primero."
+        )
+
+    if not tenant.token and not (tenant.username and tenant.password):
+        raise HTTPException(status_code=400, detail="El Tenant no tiene un token JWT ni credenciales configuradas")
+
+    return server, tenant
+
+
+@router.get("/{server_id}")
+async def list_server_devices(
+    server_id: str,
+    tenant_id: Optional[str] = Query(default=None, description="ID opcional del Tenant específico"),
+    limit: int = 100,
+    page: int = 0,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Lista dispositivos desde una instancia ThingsBoard utilizando las credenciales del Tenant.
+    """
+    server, tenant = await _resolve_server_and_tenant(server_id, tenant_id, current_user)
+
+    client = ThingsBoardClient(
+        base_url=server.base_url,
+        token=tenant.token,
+        refresh_token=tenant.refresh_token,
+        username=tenant.username,
+        password=tenant.password
+    )
+
+    token = tenant.token
+    if not token and tenant.username and tenant.password:
+        login_res = await client.login()
+        if login_res and "token" in login_res:
+            token = login_res["token"]
+            tenant.token = token
+            tenant.refresh_token = login_res.get("refreshToken")
+            await tenant.save()
+
     try:
-        devices_data = await client.get_tenant_devices(token=server.token, limit=limit, page=page)
+        devices_data = await client.get_tenant_devices(token=token, limit=limit, page=page)
         return devices_data
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error consultando dispositivos en ThingsBoard: {str(e)}")
@@ -59,28 +117,32 @@ async def list_server_devices(
 async def get_device_details(
     server_id: str,
     device_id: str,
+    tenant_id: Optional[str] = Query(default=None, description="ID opcional del Tenant específico"),
     current_user: User = Depends(get_current_user)
 ):
     """
     Obtiene los detalles de un dispositivo específico en el servidor ThingsBoard seleccionado.
     """
-    try:
-        obj_id = PydanticObjectId(server_id)
-        server = await TBServer.get(obj_id)
-    except Exception:
-        server = await TBServer.get(server_id)
+    server, tenant = await _resolve_server_and_tenant(server_id, tenant_id, current_user)
 
-    if not server:
-        raise HTTPException(status_code=404, detail="Servidor ThingsBoard no encontrado")
+    client = ThingsBoardClient(
+        base_url=server.base_url,
+        token=tenant.token,
+        refresh_token=tenant.refresh_token,
+        username=tenant.username,
+        password=tenant.password
+    )
 
-    if current_user.role != "admin" and server.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="No tienes permisos para este servidor")
+    token = tenant.token
+    if not token and tenant.username and tenant.password:
+        login_res = await client.login()
+        if login_res and "token" in login_res:
+            token = login_res["token"]
+            tenant.token = token
+            tenant.refresh_token = login_res.get("refreshToken")
+            await tenant.save()
 
-    if not server.token:
-        raise HTTPException(status_code=400, detail="El servidor no tiene un token JWT configurado")
-
-    client = ThingsBoardClient(base_url=server.base_url, token=server.token, refresh_token=server.refresh_token)
-    device = await client.get_device_by_id(device_id=device_id)
+    device = await client.get_device_by_id(device_id=device_id, token=token)
 
     if not device:
         raise HTTPException(status_code=404, detail="Dispositivo no encontrado en ThingsBoard")
@@ -95,24 +157,16 @@ async def provision_devices(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Plantilla base para futuros scripts de aprovisionamiento masivo de dispositivos en ThingsBoard.
+    Plantilla base para aprovisionamiento masivo de dispositivos en ThingsBoard por Tenant.
     """
-    try:
-        obj_id = PydanticObjectId(server_id)
-        server = await TBServer.get(obj_id)
-    except Exception:
-        server = await TBServer.get(server_id)
-
-    if not server:
-        raise HTTPException(status_code=404, detail="Servidor ThingsBoard no encontrado")
-
-    if current_user.role != "admin" and server.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="No tienes permisos para este servidor")
+    server, tenant = await _resolve_server_and_tenant(server_id, request.tenant_id, current_user)
 
     return {
         "status": "ready_for_provisioning",
         "server_id": str(server.id),
         "server_name": server.name,
+        "tenant_id": str(tenant.id),
+        "tenant_name": tenant.name,
         "base_url": server.base_url,
         "count": len(request.devices),
         "message": "Plantilla de aprovisionamiento lista para integración con scripts de orquestación."

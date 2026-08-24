@@ -41,16 +41,19 @@ class ThingsBoardClient:
             raise ValueError("Se requiere usuario y contraseña para iniciar sesión en ThingsBoard")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/api/auth/login",
-                json={"username": user, "password": pwd}
-            )
-            if response.status_code == 200:
-                data = response.json()
-                self.token = data.get("token")
-                self.refresh_token = data.get("refreshToken")
-                return data
-            return None
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/auth/login",
+                    json={"username": user, "password": pwd}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    self.token = data.get("token")
+                    self.refresh_token = data.get("refreshToken")
+                    return data
+                return None
+            except Exception:
+                return None
 
     async def refresh_jwt_token(self, refresh_token: Optional[str] = None) -> dict:
         """
@@ -96,7 +99,6 @@ class ThingsBoardClient:
         """
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                # 1. Probar conectividad al endpoint de sistema
                 res = await client.get(f"{self.base_url}/api/noauth/activate")
                 is_reachable = res.status_code in (200, 400, 404)
             except Exception as e:
