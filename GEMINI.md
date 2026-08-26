@@ -16,6 +16,8 @@
 9. **Renovación Autónoma de Tokens con Persistencia:** Mecanismo resiliente en el Celery Worker que intercepta errores HTTP 401, renueva el par de tokens (`token` y `refresh_token`) y **actualiza asíncronamente el documento `TBTenant` cifrado en MongoDB** para futuras ejecuciones.
 10. **Orquestador de Telemetría Masiva y Catálogo TBBackup:** Particionado automático por meses, paginación continua por marcas de tiempo (`ts`), control de concurrencia con semáforos, *checkpoints* en Redis, compresión ZIP en volúmenes locales persistentes y catálogo histórico `TBBackup` en MongoDB.
 11. **Distributed Lock & Heartbeat para Tareas Multi-Día:** Candado distribuido en Redis (`tb_server_lock:{server_id}`) con Fail Fast (HTTP 409 Conflict) en FastAPI, latido asíncrono (Heartbeat) de renovación cada 30 min (TTL 1 hora) en el Celery Worker y `visibility_timeout` de 10 días (`864,000s`) para descargas ininterrumpidas de larga duración (6 a 8 días).
+12. **Automatizaciones y Patrón Dispatcher con Celery Beat (`TBScheduledTask`):** Programación dinámica de tareas en base de datos sin alterar código fuente, resolución periódica cada 1 min (`tasks.master_dispatcher`), conversión de zonas horarias locales (`America/Mexico_City`) a UTC puro, aislamiento granular ante fallos y disparo manual bajo demanda.
+13. **Política de Retención y Limpieza Automatizada de Disco (`tasks.cleanup_old_backups`):** Sincronización estricta con el catálogo `TBBackup` en MongoDB, purga defensiva de archivos ZIP caducados (`days_to_keep`) y barrido de directorios temporales huérfanos/zombis (`tmp_*` con antigüedad mayor a 24 horas).
 
 ---
 
@@ -35,6 +37,7 @@ flowchart TD
         ServerRouter["/api/v1/servers\n(CRUD TBServer, CRUD TBTenant & Test-Connection)"]
         TelemRouter["/api/v1/telemetry\n(Download con tenant_id / Active / Stream SSE / ZIP)"]
         DeviceRouter["/api/v1/devices\n(List Devices / Batch Provisioning por Tenant)"]
+        SchedulerRouter["/api/v1/scheduler/tasks\n(CRUD TBScheduledTask / Trigger Manual)"]
     end
 
     subgraph Mongo ["Base de Datos MongoDB"]
@@ -42,20 +45,23 @@ flowchart TD
         TBTenantsCol[("Colección 'tb_tenants'\n- server_id (Link)\n- name\n- username (Plain)\n- encrypted_password (Fernet)\n- encrypted_token (Fernet)\n- encrypted_refresh_token (Fernet)")]
         UsersCol[("Colección 'users'\n- username\n- email\n- hashed_password\n- role, is_active, is_superuser")]
         BackupsCol[("Colección 'tb_backups'\n- tenant_id (Link)\n- task_id, file_name, file_size")]
+        ScheduledCol[("Colección 'tb_scheduled_tasks'\n- name, task_name, cron_expression\n- payload, next_run_time, is_active")]
         AuditCol[("Colección 'audit_logs'\n- timestamp, method, endpoint, status_code, payload")]
         CasbinCol[("Colección 'casbin_rule'\n- ptype, v0 (sub), v1 (dom), v2 (obj), v3 (act)")]
     end
 
     subgraph Broker ["Redis State & Broker"]
-        CeleryQueue["Cola de Tareas Celery"]
-        PubSubStreams["Streams SSE Pub/Sub\nuser:<user_id>:stream:<task_id>"]
-        UserRegistry["Hash Tareas Activas\ntb_events:user:<user_id>:registry"]
-        TokenBlacklist["Lista Negra de Tokens\ntb_revoked_token:<token>"]
-        RateLimits["Límites de Intentos de Login\ntb_login_attempts:<ip>"]
+        CeleryQueue["Cola de Tareas Celery\n(telemetry_tasks)"]
+        PubSubStreams["Streams SSE Pub/Sub\nuser:{user_id}:stream:{task_id}"]
+        UserRegistry["Hash Tareas Activas\ntb_events:user:{user_id}:registry"]
+        TokenBlacklist["Lista Negra de Tokens\ntb_revoked_token:{token}"]
+        RateLimits["Límites de Intentos de Login\ntb_login_attempts:{ip}"]
     end
 
-    subgraph CeleryWorker ["Celery Worker (workers/tasks.py - Router)"]
+    subgraph CeleryWorker ["Celery Workers & Beat (workers/tasks.py)"]
+        BeatScheduler["Celery Beat\n(master_dispatcher_task cada 1 min)"]
         TaskRouter["download_telemetry_task\n(tenant_id, user_id, payload)"]
+        CleanupTask["cleanup_old_backups\n(Purga ZIPs caducados y zombis tmp)"]
         Heartbeat["_heartbeat_server_lock\n(Renovación cada 30 min)"]
     end
 
@@ -76,14 +82,23 @@ flowchart TD
     ServerRouter -->|CRUD TBTenants con Fernet| TBTenantsCol
     UsersRouter -->|Gestión de Cuentas| UsersCol
     IAMRouter -->|Políticas RBAC| CasbinCol
+    SchedulerRouter -->|CRUD Automatizaciones| ScheduledCol
+    SchedulerRouter -.->|Trigger Inmediato| CeleryQueue
     TelemRouter -->|Encola con tenant_id y user_id| CeleryQueue
 
+    BeatScheduler -->|1. Consulta tareas vencidas en UTC| ScheduledCol
+    BeatScheduler -->|2. Despacha dinámicamente| CeleryQueue
     CeleryQueue --> TaskRouter
+    CeleryQueue --> CleanupTask
+
     TaskRouter -->|1. Consulta TBTenant por tenant_id| TBTenantsCol
     TaskRouter -->|2. Resuelve Servidor Padre| TBServersCol
     TaskRouter -->|3. Descifra credenciales en RAM| CryptoService
     TaskRouter -->|4. Instancia Dinámicamente| TB_Dynamic
     TaskRouter -->|5. Inicia Heartbeat y Delega| TelemService
+
+    CleanupTask -->|1. Consulta registros vencidos| BackupsCol
+    CleanupTask -->|2. Elimina ZIPs en disco y borra docs| BackupsCol
 
     TelemService -->|Peticiones HTTP Asíncronas| TB_Prod
     TelemService -->|Peticiones HTTP Asíncronas| TB_Staging
@@ -131,9 +146,13 @@ Thingsboard_Api/
 │       ├── telemetry/                 # Dominio de Telemetría y Respaldos (/api/v1/telemetry)
 │       │   ├── __init__.py
 │       │   └── router.py              # Encolado por tenant_id, tareas activas, SSE y descarga de ZIP
-│       └── devices/                   # Dominio de Dispositivos y Aprovisionamiento (/api/v1/devices)
+│       ├── devices/                   # Dominio de Dispositivos y Aprovisionamiento (/api/v1/devices)
+│       │   ├── __init__.py
+│       │   └── router.py              # Listado y aprovisionamiento masivo por Tenant
+│       └── scheduler/                 # Dominio de Automatizaciones y Tareas Programadas (/api/v1/scheduler/tasks)
 │           ├── __init__.py
-│           └── router.py              # Listado y aprovisionamiento masivo por Tenant
+│           ├── schemas.py             # DTOs Pydantic v2 (ScheduledTaskCreate/Update/Response) con validación croniter
+│           └── router.py              # CRUD de automatizaciones, recálculo cron y trigger manual en Celery
 ├── core/                              # Capa de infraestructura y configuración del núcleo
 │   ├── __init__.py
 │   ├── bootstrap.py                   # Arranque idempotente y creación de Superadmin inicial + políticas raíz
@@ -167,6 +186,9 @@ Thingsboard_Api/
 │   ├── verify_distributed_lock_and_heartbeat.py # Suite de verificación de distributed lock atómico y heartbeat
 │   ├── verify_workspace_isolation_and_backup_catalog.py # Suite de aislamiento tmp_{task_id} y catálogo TBBackup
 │   ├── verify_security_hardening.py   # Suite de hardening DevSecOps, anti fuerza bruta, setup token y auditoría
+│   ├── verify_celery_beat_dispatcher.py # Suite de verificación de Celery Beat, Dispatcher y Timezones
+│   ├── verify_cleanup_old_backups.py  # Suite de verificación de retención de respaldos y barrido de temporales zombis
+│   ├── verify_scheduler_endpoints.py  # Suite de verificación de endpoints HTTP del Scheduler y validación croniter
 │   └── BackupManager/                 # Herramienta standalone en Node.js para respaldos manuales
 │       ├── backups/                   # Carpeta de salida de respaldos generados por Node.js
 │       ├── helpers/
@@ -240,29 +262,49 @@ Modelo de documento `User(Document)` para la gestión de identidades y accesos d
 - `is_active`: Estado activo/inactivo.
 - `is_superuser`: Flag booleano de superadministrador.
 
-### 4.6. `core/crypto.py` (Criptografía Simétrica Fernet)
+### 4.6. `core/models/tb_scheduled_task.py` (Tareas Programadas y Despachador Dinámico)
+Modelo de documento `TBScheduledTask(Document)` para el Patrón Dispatcher Dinámico con Celery Beat:
+- `name`: Nombre descriptivo de la tarea (ej: `"Monitoreo de Telemetría Bajío"`).
+- `task_name`: Nombre canónico registrado en Celery (ej: `"tasks.monitor_devices"`, `"download_telemetry_task"`).
+- `cron_expression`: Expresión cron estándar (ej: `"0 8 * * *"`, `"*/15 * * * *"`).
+- `payload`: Diccionario (`Dict[str, Any]`) con los kwargs a despachar en Celery.
+- `next_run_time`: Marca de tiempo estricta en UTC (`datetime`) para la próxima ejecución.
+- `is_active`: Flag booleano que activa o desactiva la tarea.
+- `last_run_status`: Estado o identificador de la última ejecución (ej: `"DISPATCHED (Celery Task ID: ...)"`, `"ERROR: ..."`).
+- `last_run_at`: Marca de tiempo UTC de la última ejecución despachada.
+- Método `compute_next_run(base_time, tz_str)`: Interpreta la expresión cron en la zona horaria local (`settings.APP_TIMEZONE = "America/Mexico_City"`) y retorna la fecha calculada convertida a UTC puro.
+- Validador `ensure_tz_aware`: Garantiza que todas las fechas recuperadas de BSON sean offset-aware en UTC (`+00:00`).
+
+### 4.7. `core/crypto.py` (Criptografía Simétrica Fernet)
 - `encrypt_data(plain_text: Optional[str]) -> Optional[str]`: Cifra texto plano utilizando AES-128-CBC autenticado con HMAC-SHA256 codificado en Base64 URL-Safe.
 - `decrypt_data(cipher_text: Optional[str]) -> Optional[str]`: Descifra el ciphertext y recupera el texto plano en memoria RAM.
 - Derivación determinística automática vía SHA-256 si `ENCRYPTION_KEY` es una frase de paso arbitraria.
 
-### 4.7. `core/redis_client.py` (`DynamicRedisClient`)
+### 4.8. `core/redis_client.py` (`DynamicRedisClient`)
 - `DynamicRedisClient`: Wrapper dinámico que detecta el estado del Event Loop actual (`asyncio.get_running_loop()`) y reinicializa automáticamente el Connection Pool si el loop fue cerrado (evita `RuntimeError: Event loop is closed` en Celery Workers).
 - `get_redis_client()`: Retorna la instancia de Redis activa y ligada al loop actual.
 
-### 4.8. `core/casbin_enforcer.py` (IAM con PyCasbin)
+### 4.9. `core/casbin_enforcer.py` (IAM con PyCasbin)
 - `init_casbin_enforcer()`: Inicializa el `AsyncEnforcer` de Casbin con el adaptador Motor (`casbin-motor-adapter`) apuntando a la colección `casbin_rule`.
 - `get_casbin_enforcer()` / `reload_casbin_policy()`: Acceso global y recarga en caliente de políticas de autorización.
 
-### 4.9. `core/database.py`
-- `init_db(custom_client=None, database_name=None)`: Inicializa la conexión asíncrona con Motor y registra todos los modelos Beanie (`User`, `TBServer`, `TBTenant`, `TBBackup`, `AuditLog`). Detecta y recupera conexiones si el Event Loop cambió.
+### 4.10. `core/database.py`
+- `init_db(custom_client=None, database_name=None)`: Inicializa la conexión asíncrona con Motor y registra todos los modelos Beanie (`User`, `TBServer`, `TBTenant`, `TBBackup`, `AuditLog`, `TBScheduledTask`). Detecta y recupera conexiones si el Event Loop cambió.
 - `close_db()`: Cierra conexiones activas de MongoDB.
 
-### 4.10. `core/services/telemetry_service.py`
+### 4.11. `core/services/telemetry_service.py`
 - `refresh_tenant_tokens_in_db(tenant_id, tb, token_ref, payload)`: Ejecuta la renovación autónoma ante errores HTTP 401 usando `refresh_token` o credenciales y **actualiza el documento `TBTenant` cifrado en MongoDB de forma asíncrona**.
 - `download_telemetry_for_key()`: Paginación continua por marcas de tiempo con guardado en ruta aislada `backups/tmp_{task_id}/...`, checkpointing en Redis, captura de 401 y semáforos de concurrencia.
 - `run_download_orchestrator()`: Orquestador principal que descubre dispositivos, particiona intervalos mensuales, ejecuta descargas paralelas, empaqueta el ZIP descriptivo en `backups/`, registra el documento `TBBackup` en MongoDB y elimina completamente la carpeta temporal `tmp_{task_id}`.
 
-### 4.11. `workers/tasks.py` (Enrutador Ligero de Celery)
+### 4.12. `workers/tasks.py` (Enrutador Ligero y Despachador Maestro Celery Beat)
+- `celery_app.conf.timezone = "UTC"` y `beat_schedule`: Tarea programada cada 1 minuto (`crontab(minute='*')`) que invoca a `tasks.master_dispatcher`.
+- `master_dispatcher_task()` / `_execute_master_dispatcher()`:
+  1. Conexión resiliente a MongoDB Beanie.
+  2. Búsqueda de tareas activas vencidas (`is_active == True` y `next_run_time <= now_utc`).
+  3. Despacho dinámico a Celery con `send_task(task_name, kwargs=payload)`.
+  4. Conversión de zona horaria local (`America/Mexico_City`) a UTC puro para calcular el siguiente `next_run_time`.
+  5. Aislamiento granular de errores por tarea para garantizar continuidad del bucle.
 - `_execute_routed_telemetry_download(task_id, payload)`:
   1. Resuelve `tenant_id` en MongoDB usando Beanie.
   2. Obtiene el documento `TBServer` padre mediante `tenant.get_server()`.
@@ -271,6 +313,23 @@ Modelo de documento `User(Document)` para la gestión de identidades y accesos d
   5. Adquiere candado distribuido `tb_server_lock:{server_id}` e inicia latido `_heartbeat_server_lock` (cada 30 min).
   6. Instancia dinámicamente `ThingsBoardClient` y delega la ejecución al `telemetry_service`.
   7. En bloque `finally:`, cancela el heartbeat y libera el candado en Redis de forma garantizada.
+- `cleanup_old_backups_task(days_to_keep=30)` / `_execute_cleanup_old_backups(days_to_keep=30)`:
+  1. Sincronización estricta con MongoDB: Identifica documentos `TBBackup` con `created_at <= cutoff_date` (`days_to_keep`).
+  2. Eliminación física segura: Borra los archivos ZIP en `settings.BACKUP_DIR` con control de excepciones y suprime los documentos del catálogo en MongoDB.
+  3. Barrido de temporales zombis: Escanea el directorio base de respaldos y elimina directorios `tmp_*` huérfanos con antigüedad (`st_mtime`) superior a 24 horas (`shutil.rmtree`).
+  4. Retorno estructurado de métricas operativas (`status`, `deleted_db_records`, `deleted_files`, `missing_files`, `zombie_dirs_deleted`, `errors`).
+
+### 4.13. `api/endpoints/scheduler/` (Dominio de Automatizaciones y Scheduler HTTP)
+- `schemas.py`:
+  - `ScheduledTaskCreate`: DTO con validador `@field_validator("cron_expression")` que invoca `croniter.is_valid()` (HTTP 422 si la expresión es corrupta).
+  - `ScheduledTaskUpdate`: DTO con campos opcionales y validación de cron.
+  - `ScheduledTaskResponse` y `ScheduledTaskTriggerResponse`: DTOs de serialización enriquecidos con timestamps UTC y estado.
+- `router.py` (`/api/v1/scheduler/tasks`):
+  - `POST /`: Creación de tareas, cálculo en tiempo real del primer `next_run_time` en UTC y persistencia en MongoDB.
+  - `GET /` & `GET /{task_id}`: Listado con filtros (`is_active`, `task_name`) y consulta individual protegidos con `CasbinAuth(action="read")`.
+  - `PUT /{task_id}`: Actualización parcial y recálculo automático de `next_run_time` si la expresión cron cambia.
+  - `DELETE /{task_id}`: Eliminación física en MongoDB.
+  - `POST /{task_id}/trigger`: Disparo manual inmediato hacia Celery con `celery_app.send_task()`, registrando estado `MANUALLY_TRIGGERED` sin alterar el horario cron programado.
 
 ---
 
@@ -573,6 +632,63 @@ backups/
 
 ---
 
+### 7.7. Dominio de Automatizaciones y Scheduler (`/api/v1/scheduler/tasks`)
+
+#### 1. Crear Tarea Programada
+- **Método:** `POST` | **Ruta:** `/api/v1/scheduler/tasks`
+- **Permiso Casbin:** `resource="scheduler"`, `action="write"`, `domain="server"`
+- **Cuerpo:**
+```json
+{
+  "name": "Purga Diaria de Respaldos",
+  "task_name": "tasks.cleanup_old_backups",
+  "cron_expression": "0 3 * * *",
+  "payload": {
+    "days_to_keep": 30
+  },
+  "is_active": true
+}
+```
+- **Respuesta (201 Created):** Objeto `ScheduledTaskResponse` con `next_run_time` inicial calculado en UTC según `settings.APP_TIMEZONE`.
+
+#### 2. Listar Tareas Programadas
+- **Método:** `GET` | **Ruta:** `/api/v1/scheduler/tasks?is_active=true&task_name=tasks.cleanup_old_backups`
+- **Permiso Casbin:** `resource="scheduler"`, `action="read"`, `domain="server"`
+- **Respuesta (200 OK):** Lista de `ScheduledTaskResponse`.
+
+#### 3. Consultar Detalle de Tarea Programada
+- **Método:** `GET` | **Ruta:** `/api/v1/scheduler/tasks/{task_id}`
+- **Permiso Casbin:** `resource="scheduler"`, `action="read"`, `domain="server"`
+- **Respuesta (200 OK):** Objeto `ScheduledTaskResponse`.
+
+#### 4. Actualizar Tarea Programada
+- **Método:** `PUT` | **Ruta:** `/api/v1/scheduler/tasks/{task_id}`
+- **Permiso Casbin:** `resource="scheduler"`, `action="write"`, `domain="server"`
+- **Efecto:** Si `cron_expression` cambia, recalcula automáticamente `next_run_time` en tiempo real.
+- **Respuesta (200 OK):** Objeto `ScheduledTaskResponse` actualizado.
+
+#### 5. Eliminar Tarea Programada
+- **Método:** `DELETE` | **Ruta:** `/api/v1/scheduler/tasks/{task_id}`
+- **Permiso Casbin:** `resource="scheduler"`, `action="delete"`, `domain="server"`
+- **Respuesta (200 OK):** Confirmación de eliminación física en MongoDB.
+
+#### 6. Disparo Manual Inmediato (Trigger Bajo Demanda)
+- **Método:** `POST` | **Ruta:** `/api/v1/scheduler/tasks/{task_id}/trigger`
+- **Permiso Casbin:** `resource="scheduler"`, `action="write"`, `domain="server"`
+- **Efecto:** Encola la tarea en Celery inmediatamente (`celery_app.send_task()`) con sus kwargs, actualizando `last_run_status` a `MANUALLY_TRIGGERED` sin alterar el calendario de cron programado.
+- **Respuesta (200 OK):**
+```json
+{
+  "task_id": "6a8e8135d05f43e58c362ac1",
+  "celery_task_id": "c1f7b882-9f6c-48be-8f6a-49c905b22b6d",
+  "status": "DISPATCHED",
+  "message": "Tarea 'Purga Diaria de Respaldos' despachada exitosamente a Celery",
+  "dispatched_at": "2026-08-26T09:00:00Z"
+}
+```
+
+---
+
 ## 8. Guía Completa de Configuración, Despliegue y Ejecución
 
 ### 8.1. Requisitos Previos
@@ -610,10 +726,12 @@ Crea o edita el archivo `.env` en la raíz del proyecto (`ThingsboardApiGateway/
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. Configuración General de la Aplicación
+# 1. Configuración General de la Aplicación y Almacenamiento
 # ------------------------------------------------------------------------------
 PROJECT_NAME="ThingsBoard Super API Gateway"
 DEBUG=false
+APP_TIMEZONE="America/Mexico_City"
+BACKUP_DIR="backups"
 
 # ------------------------------------------------------------------------------
 # 2. Base de Datos MongoDB
@@ -669,7 +787,7 @@ docker run -d --name tb-redis -v tb-redis-data:/data -p 6379:6379 redis:7-alpine
 
 ### 8.5. Ejecución de los Servicios Principales
 
-Para operar la plataforma completa se requieren dos terminales activas:
+Para operar la plataforma completa se requieren tres terminales activas:
 
 #### 🚀 Terminal 1: Servidor Web FastAPI (API Gateway)
 
@@ -708,11 +826,21 @@ source venv/bin/activate
 celery -A workers.tasks.celery_app worker --loglevel=info -c 4
 ```
 
+#### ⏰ Terminal 3: Celery Beat (Despachador Maestro Periódico)
+
+```powershell
+# Activar entorno virtual
+venv\Scripts\Activate.ps1
+
+# Iniciar Celery Beat Scheduler
+celery -A workers.tasks.celery_app beat --loglevel=info
+```
+
 ---
 
 ### 8.6. Ejecución de las Suites de Pruebas Automatizadas
 
-El proyecto incluye una batería integral de 7 suites de pruebas con `mongomock_motor`, `httpx.ASGITransport` y simulación en memoria para validaciones determinísticas y aisladas:
+El proyecto incluye una batería integral de 10 suites de pruebas automatizadas con `mongomock_motor`, `httpx.ASGITransport` y simulación en memoria para validaciones determinísticas, resilientes y 100% aisladas:
 
 ```powershell
 # 1. Probar Cifrado Simétrico Fernet, getters/setters seguros y Cero Texto Plano en MongoDB crudo
@@ -735,6 +863,15 @@ venv\Scripts\python scripts/verify_workspace_isolation_and_backup_catalog.py
 
 # 7. Probar Hardening DevSecOps, Protección Anti Fuerza Bruta (429), Setup Tokens y Auditoría Sanitizada
 venv\Scripts\python scripts/verify_security_hardening.py
+
+# 8. Probar Celery Beat, Despachador Maestro Dinámico y Conversión de Timezones (America/Mexico_City -> UTC)
+venv\Scripts\python scripts/verify_celery_beat_dispatcher.py
+
+# 9. Probar Política de Retención de Respaldos, Sincronización en MongoDB y Purga de Temporales Zombis
+venv\Scripts\python scripts/verify_cleanup_old_backups.py
+
+# 10. Probar Endpoints HTTP del Scheduler (/api/v1/scheduler/tasks), Validación croniter y RBAC
+venv\Scripts\python scripts/verify_scheduler_endpoints.py
 ```
 
 ---

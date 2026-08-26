@@ -3,7 +3,8 @@ from core.models.tb_server import TBServer
 from core.models.tb_tenant import TBTenant
 from core.models.tb_backup import TBBackup
 from core.models.audit_log import AuditLog
+from core.models.tb_scheduled_task import TBScheduledTask
 
-__all__ = ["User", "TBServer", "TBTenant", "TBBackup", "AuditLog"]
+__all__ = ["User", "TBServer", "TBTenant", "TBBackup", "AuditLog", "TBScheduledTask"]
 
 
