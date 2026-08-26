@@ -83,6 +83,7 @@ async def bootstrap_superadmin():
                 ("tenant_admin", "*", "*", "*"),
                 ("operator", "*", "telemetry", "read"),
                 ("operator", "*", "devices", "read"),
+                ("operator", "*", "scheduler", "read"),
                 ("viewer", "*", "telemetry", "read"),
             ]
 

@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------------------
     PROJECT_NAME: str = Field(..., description="Nombre del proyecto y API Gateway")
     DEBUG: bool = Field(..., description="Flag de modo depuración")
+    APP_TIMEZONE: str = Field(default="America/Mexico_City", description="Zona horaria de referencia para la aplicación y expresiones cron")
+    BACKUP_DIR: str = Field(default="backups", description="Directorio base para almacenamiento de respaldos ZIP y temporales")
 
     # --------------------------------------------------------------------------
     # Base de Datos MongoDB
