@@ -218,12 +218,10 @@ async def refresh_tenant_tokens_in_db(
                 tenant_doc = await TBTenant.get(tenant_id)
 
             if tenant_doc:
-                tenant_doc.token = new_token
-                if new_refresh_token:
-                    tenant_doc.refresh_token = new_refresh_token
+                tenant_doc.set_tokens(new_token, new_refresh_token)
                 tenant_doc.updated_at = datetime.now(timezone.utc)
                 await tenant_doc.save()
-                logger.info(f"[MongoDB] Documento TBTenant '{tenant_doc.name}' ({tenant_id}) sincronizado en MongoDB con nuevos tokens.")
+                logger.info(f"[MongoDB] Documento TBTenant '{tenant_doc.name}' ({tenant_id}) sincronizado en MongoDB con nuevos tokens cifrados.")
         except Exception as e:
             logger.error(f"[MongoDB] Error actualizando tokens en TBTenant ({tenant_id}): {e}")
 

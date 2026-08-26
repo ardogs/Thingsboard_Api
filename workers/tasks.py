@@ -11,6 +11,7 @@ from core.database import init_db
 from core.models.tb_server import TBServer
 from core.models.tb_tenant import TBTenant
 from core.tb_client import ThingsBoardClient
+from core.redis_client import redis_client, get_redis_client
 from core.logger import logger
 from core.services.telemetry_service import (
     run_download_orchestrator,
@@ -95,35 +96,38 @@ async def _execute_routed_telemetry_download(task_id: str, payload: dict):
     server_id = str(server.id)
     logger.info(f"[Celery Router] Tenant resuelto: '{tenant.name}' en Servidor: '{server.name}' (ID: {server_id}, URL: {server.base_url})")
 
-    # 3. Instanciar cliente dinámico ThingsBoardClient
+    # 3. Instanciar cliente dinámico ThingsBoardClient con credenciales descifradas en memoria RAM
+    plain_token = tenant.get_token()
+    plain_refresh_token = tenant.get_refresh_token()
+    plain_password = tenant.get_password()
+
     tb_client = ThingsBoardClient(
         base_url=server.base_url,
-        token=tenant.token,
-        refresh_token=tenant.refresh_token,
+        token=plain_token,
+        refresh_token=plain_refresh_token,
         username=tenant.username,
-        password=tenant.password
+        password=plain_password
     )
 
     # 4. REGLA DE ARRANQUE EN FRÍO:
-    # Si tenant.token es None o está vacío, ejecutar login inicial con credenciales y persistir en MongoDB
-    if not tenant.token or not str(tenant.token).strip():
-        if not tenant.username or not tenant.password:
+    # Si no hay token inicial, ejecutar login inicial con credenciales y persistir en MongoDB cifrado
+    if not plain_token or not str(plain_token).strip():
+        if not tenant.username or not plain_password:
             raise ValueError(
                 f"El Tenant '{tenant.name}' no tiene tokens iniciales ni credenciales (username/password) configuradas para el arranque en frío."
             )
         logger.info(f"[Celery Worker] Arranque en frío detectado para Tenant '{tenant.name}'. Ejecutando login inicial en {server.base_url}...")
-        login_res = await tb_client.login(tenant.username, tenant.password)
+        login_res = await tb_client.login(tenant.username, plain_password)
         if not login_res or "token" not in login_res:
             raise ValueError(
                 f"Fallo de autenticación en arranque en frío para Tenant '{tenant.name}' en {server.base_url}."
             )
         
-        # Persistir tokens iniciales en MongoDB
-        tenant.token = login_res["token"]
-        tenant.refresh_token = login_res.get("refreshToken")
+        # Persistir tokens iniciales cifrados en MongoDB
+        tenant.set_tokens(login_res["token"], login_res.get("refreshToken"))
         tenant.updated_at = datetime.now(timezone.utc)
         await tenant.save()
-        logger.info(f"[MongoDB] Tokens de arranque en frío persistidos exitosamente para TBTenant '{tenant.name}'.")
+        logger.info(f"[MongoDB] Tokens de arranque en frío cifrados y persistidos exitosamente para TBTenant '{tenant.name}'.")
 
     payload["tenant_name"] = tenant.name
     payload["server_url"] = server.base_url
@@ -131,7 +135,7 @@ async def _execute_routed_telemetry_download(task_id: str, payload: dict):
 
     # 5. Herencia del Candado Distribuido (creado por FastAPI) y Lanzamiento de Heartbeat
     lock_key = get_server_lock_key(server_id)
-    redis_conn = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+    redis_conn = get_redis_client()
 
     # Extender el TTL del candado a 1 hora (3600s) ya que el worker tomó el relevo de la ejecución
     await redis_conn.expire(lock_key, 3600)
@@ -166,8 +170,6 @@ async def _execute_routed_telemetry_download(task_id: str, payload: dict):
             logger.info(f"[Celery Worker] Candado distribuido '{lock_key}' eliminado exitosamente de Redis.")
         except Exception as e:
             logger.error(f"[Celery Worker] Error al eliminar candado '{lock_key}' en Redis: {e}")
-        finally:
-            await redis_conn.aclose()
 
 
 def release_server_lock_sync(server_id: Optional[str]):

@@ -15,6 +15,7 @@ from core.models.tb_backup import TBBackup
 from core.config import settings
 from core.logger import logger
 from core.redis_client import redis_client
+from core.casbin_enforcer import get_casbin_enforcer
 from api.deps import User, get_current_user
 from workers.tasks import (
     download_telemetry_task,
@@ -110,12 +111,25 @@ async def download_telemetry(
             detail=f"Tenant de ThingsBoard con ID '{request.tenant_id}' no encontrado en MongoDB"
         )
 
-    # 2. Validar aislamiento y permisos de usuario
-    if current_user.role != "admin" and tenant_doc.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No tienes permisos para iniciar descargas en este Tenant"
-        )
+    # 2. Validar aislamiento y permisos de usuario (Casbin RBAC + Ownership + Superadmin)
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    is_owner = tenant_doc.user_id in [str(current_user.id), current_user.id]
+    if not is_admin and not is_owner:
+        try:
+            enforcer = get_casbin_enforcer()
+            user_id_str = str(current_user.id)
+            tenant_domain = f"tenant:{tenant_doc.id}"
+            is_allowed = enforcer.enforce(user_id_str, tenant_domain, "telemetry", "write")
+            if not is_allowed and current_user.username:
+                is_allowed = enforcer.enforce(current_user.username, tenant_domain, "telemetry", "write")
+        except Exception:
+            is_allowed = False
+
+        if not is_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permisos para iniciar descargas en este Tenant"
+            )
 
     # 3. Resolver servidor ThingsBoard padre
     server_doc = await tenant_doc.get_server()
@@ -149,7 +163,7 @@ async def download_telemetry(
         "concurrency_limit": request.concurrency_limit,
         "page_limit": request.page_limit,
         "force_reload": request.force_reload,
-        "user_id": current_user.id
+        "user_id": str(current_user.id)
     }
 
     # 6. Encolar la tarea en Celery de forma completamente asíncrona y no bloqueante
@@ -162,7 +176,7 @@ async def download_telemetry(
     return {
         "task_id": task.id,
         "status": "Task enqueued",
-        "user_id": current_user.id,
+        "user_id": str(current_user.id),
         "tenant_id": str(tenant_doc.id),
         "tenant_name": tenant_doc.name,
         "server_id": server_id,
@@ -177,7 +191,7 @@ async def get_active_tasks(current_user: User = Depends(get_current_user)):
     """
     r = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
     try:
-        user_registry_key = get_user_registry_key(current_user.id)
+        user_registry_key = get_user_registry_key(str(current_user.id))
         raw_tasks = await r.hgetall(user_registry_key)
         active_tasks: List[ActiveTaskResponse] = []
 
@@ -202,7 +216,7 @@ async def stream_task_progress(
     """
     Endpoint Server-Sent Events (SSE) para transmitir el progreso de una tarea en tiempo real.
     """
-    user_id = current_user.id
+    user_id = str(current_user.id)
 
     async def event_generator():
         r = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
@@ -300,12 +314,25 @@ async def list_tenant_backups(
             detail=f"Tenant de ThingsBoard con ID '{tenant_id}' no encontrado en MongoDB"
         )
 
-    # 2. Validar permisos de acceso al Tenant
-    if current_user.role != "admin" and tenant_doc.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No tienes permisos para consultar los respaldos de este Tenant"
-        )
+    # 2. Validar permisos de acceso al Tenant (Casbin RBAC + Ownership + Superadmin)
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    is_owner = tenant_doc.user_id in [str(current_user.id), current_user.id]
+    if not is_admin and not is_owner:
+        try:
+            enforcer = get_casbin_enforcer()
+            user_id_str = str(current_user.id)
+            tenant_domain = f"tenant:{tenant_doc.id}"
+            is_allowed = enforcer.enforce(user_id_str, tenant_domain, "telemetry", "read")
+            if not is_allowed and current_user.username:
+                is_allowed = enforcer.enforce(current_user.username, tenant_domain, "telemetry", "read")
+        except Exception:
+            is_allowed = False
+
+        if not is_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permisos para consultar los respaldos de este Tenant"
+            )
 
     # 3. Consultar documentos TBBackup asociados al Tenant
     ref = tenant_doc.to_ref()
@@ -359,8 +386,20 @@ async def download_file(
 
     if backup_doc:
         tenant_doc = await backup_doc.get_tenant()
-        if current_user.role != "admin" and backup_doc.requested_by != current_user.id:
-            if tenant_doc and tenant_doc.user_id != current_user.id:
+        is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+        is_requester = backup_doc.requested_by in [str(current_user.id), current_user.id]
+        is_tenant_owner = tenant_doc and tenant_doc.user_id in [str(current_user.id), current_user.id]
+
+        if not is_admin and not is_requester and not is_tenant_owner:
+            # Validar con Casbin si tiene permisos de lectura para ese tenant
+            tenant_id_str = f"tenant:{tenant_doc.id}" if tenant_doc else "*"
+            try:
+                enforcer = get_casbin_enforcer()
+                is_allowed = enforcer.enforce(str(current_user.id), tenant_id_str, "telemetry", "read")
+            except Exception:
+                is_allowed = False
+
+            if not is_allowed:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="No tienes permisos para descargar este respaldo"

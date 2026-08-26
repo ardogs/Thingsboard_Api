@@ -38,7 +38,8 @@ async def _resolve_server_and_tenant(
     if not server:
         raise HTTPException(status_code=404, detail="Servidor ThingsBoard no encontrado")
 
-    if current_user.role != "admin" and server.user_id != current_user.id:
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    if not is_admin and server.user_id not in [str(current_user.id), current_user.id]:
         raise HTTPException(status_code=403, detail="No tienes permisos para este servidor")
 
     # Si se especificó tenant_id, buscar ese tenant específico
@@ -52,16 +53,16 @@ async def _resolve_server_and_tenant(
 
         if not tenant:
             raise HTTPException(status_code=404, detail="Tenant especificado no encontrado")
-        if current_user.role != "admin" and tenant.user_id != current_user.id:
+        if not is_admin and tenant.user_id not in [str(current_user.id), current_user.id]:
             raise HTTPException(status_code=403, detail="No tienes permisos para este tenant")
     else:
         # Obtener el primer tenant disponible del usuario bajo este servidor
-        if current_user.role == "admin":
+        if is_admin:
             tenant = await TBTenant.find_one(TBTenant.server_id == server.to_ref())
         else:
             tenant = await TBTenant.find_one(
                 TBTenant.server_id == server.to_ref(),
-                TBTenant.user_id == current_user.id
+                {"$or": [{"user_id": str(current_user.id)}, {"user_id": current_user.id}]}
             )
 
     if not tenant:
@@ -70,7 +71,7 @@ async def _resolve_server_and_tenant(
             detail="No se encontró ningún Tenant registrado bajo este servidor. Registra un Tenant primero."
         )
 
-    if not tenant.token and not (tenant.username and tenant.password):
+    if not tenant.encrypted_token and not (tenant.username and tenant.encrypted_password):
         raise HTTPException(status_code=400, detail="El Tenant no tiene un token JWT ni credenciales configuradas")
 
     return server, tenant
@@ -91,19 +92,20 @@ async def list_server_devices(
 
     client = ThingsBoardClient(
         base_url=server.base_url,
-        token=tenant.token,
-        refresh_token=tenant.refresh_token,
+        token=tenant.get_token(),
+        refresh_token=tenant.get_refresh_token(),
         username=tenant.username,
-        password=tenant.password
+        password=tenant.get_password()
     )
 
-    token = tenant.token
-    if not token and tenant.username and tenant.password:
-        login_res = await client.login()
+    token = tenant.get_token()
+    password = tenant.get_password()
+    if not token and tenant.username and password:
+        login_res = await client.login(tenant.username, password)
         if login_res and "token" in login_res:
             token = login_res["token"]
-            tenant.token = token
-            tenant.refresh_token = login_res.get("refreshToken")
+            tenant.set_tokens(token, login_res.get("refreshToken"))
+            tenant.updated_at = datetime.now(timezone.utc)
             await tenant.save()
 
     try:
@@ -127,19 +129,20 @@ async def get_device_details(
 
     client = ThingsBoardClient(
         base_url=server.base_url,
-        token=tenant.token,
-        refresh_token=tenant.refresh_token,
+        token=tenant.get_token(),
+        refresh_token=tenant.get_refresh_token(),
         username=tenant.username,
-        password=tenant.password
+        password=tenant.get_password()
     )
 
-    token = tenant.token
-    if not token and tenant.username and tenant.password:
-        login_res = await client.login()
+    token = tenant.get_token()
+    password = tenant.get_password()
+    if not token and tenant.username and password:
+        login_res = await client.login(tenant.username, password)
         if login_res and "token" in login_res:
             token = login_res["token"]
-            tenant.token = token
-            tenant.refresh_token = login_res.get("refreshToken")
+            tenant.set_tokens(token, login_res.get("refreshToken"))
+            tenant.updated_at = datetime.now(timezone.utc)
             await tenant.save()
 
     device = await client.get_device_by_id(device_id=device_id, token=token)

@@ -10,3 +10,6 @@ python-jose[cryptography]
 python-multipart
 motor
 beanie
+casbin
+casbin-motor-adapter
+cryptography

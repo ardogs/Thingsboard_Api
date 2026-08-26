@@ -121,10 +121,10 @@ def _to_tenant_response(tenant: TBTenant) -> TenantResponse:
         server_id=_get_server_ref_id(tenant),
         name=tenant.name,
         username=tenant.username,
-        has_token=bool(tenant.token),
-        has_credentials=bool(tenant.username and tenant.password),
-        token=tenant.token,
-        refresh_token=tenant.refresh_token,
+        has_token=bool(tenant.encrypted_token),
+        has_credentials=bool(tenant.username and tenant.encrypted_password),
+        token=tenant.get_token(),
+        refresh_token=tenant.get_refresh_token(),
         custom_metadata=tenant.custom_metadata or {},
         user_id=tenant.user_id,
         is_active=tenant.is_active,
@@ -143,7 +143,8 @@ async def _resolve_server(server_id: str, current_user: User) -> TBServer:
     if not server:
         raise HTTPException(status_code=404, detail="Servidor ThingsBoard no encontrado")
 
-    if current_user.role != "admin" and server.user_id != current_user.id:
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    if not is_admin and server.user_id not in [str(current_user.id), current_user.id]:
         raise HTTPException(status_code=403, detail="No tienes permisos para acceder a este servidor")
 
     return server
@@ -159,7 +160,8 @@ async def _resolve_tenant(tenant_id: str, current_user: User) -> TBTenant:
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant de ThingsBoard no encontrado")
 
-    if current_user.role != "admin" and tenant.user_id != current_user.id:
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    if not is_admin and tenant.user_id not in [str(current_user.id), current_user.id]:
         raise HTTPException(status_code=403, detail="No tienes permisos para acceder a este tenant")
 
     return tenant
@@ -175,7 +177,7 @@ async def create_server(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Registra un nuevo servidor ThingsBoard en MongoDB asociado al usuario autenticado.
+    Registra una nueva instancia o servidor ThingsBoard en la base de datos MongoDB.
     """
     server = TBServer(
         name=request.name.strip(),
@@ -183,7 +185,7 @@ async def create_server(
         description=request.description,
         rate_limit_rpm=request.rate_limit_rpm or 60,
         custom_metadata=request.custom_metadata or {},
-        user_id=current_user.id,
+        user_id=str(current_user.id),
         is_active=True
     )
     await server.insert()
@@ -197,10 +199,13 @@ async def list_servers(
     """
     Lista todos los servidores ThingsBoard registrados pertenecientes al usuario autenticado.
     """
-    if current_user.role == "admin":
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    if is_admin:
         servers = await TBServer.find_all().to_list()
     else:
-        servers = await TBServer.find(TBServer.user_id == current_user.id).to_list()
+        servers = await TBServer.find(
+            {"$or": [{"user_id": str(current_user.id)}, {"user_id": current_user.id}]}
+        ).to_list()
 
     return [_to_server_response(s) for s in servers]
 
@@ -324,7 +329,7 @@ async def create_tenant(
 ):
     """
     Registra un nuevo Tenant bajo el servidor ThingsBoard especificado.
-    Almacena las credenciales de Tenant Admin, tokens JWT y metadatos específicos.
+    Almacena las credenciales de Tenant Admin, tokens JWT cifrados y metadatos específicos.
     Si no se proporcionan tokens, el Celery Worker ejecutará el login de arranque en frío automáticamente.
     """
     server = await _resolve_server(server_id, current_user)
@@ -333,13 +338,15 @@ async def create_tenant(
         server_id=server,
         name=request.name.strip(),
         username=request.username.strip() if request.username else None,
-        password=request.password,
-        token=request.token,
-        refresh_token=request.refresh_token,
         custom_metadata=request.custom_metadata or {},
-        user_id=current_user.id,
+        user_id=str(current_user.id),
         is_active=True
     )
+    if request.password:
+        tenant.set_password(request.password)
+    if request.token or request.refresh_token:
+        tenant.set_tokens(request.token, request.refresh_token)
+
     await tenant.insert()
     return _to_tenant_response(tenant)
 
@@ -354,12 +361,13 @@ async def list_server_tenants(
     """
     server = await _resolve_server(server_id, current_user)
 
-    if current_user.role == "admin":
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    if is_admin:
         tenants = await TBTenant.find(TBTenant.server_id == server.to_ref()).to_list()
     else:
         tenants = await TBTenant.find(
             TBTenant.server_id == server.to_ref(),
-            TBTenant.user_id == current_user.id
+            {"$or": [{"user_id": str(current_user.id)}, {"user_id": current_user.id}]}
         ).to_list()
 
     return [_to_tenant_response(t) for t in tenants]
@@ -391,7 +399,7 @@ async def update_server_tenant(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Actualiza la configuración, credenciales o metadatos de un tenant.
+    Actualiza la configuración, credenciales cifradas o metadatos de un tenant.
     """
     await _resolve_server(server_id, current_user)
     tenant = await _resolve_tenant(tenant_id, current_user)
@@ -401,15 +409,23 @@ async def update_server_tenant(
 
     update_data = request.model_dump(exclude_unset=True)
     if "name" in update_data and update_data["name"]:
-        update_data["name"] = update_data["name"].strip()
-    if "username" in update_data and update_data["username"]:
-        update_data["username"] = update_data["username"].strip()
+        tenant.name = update_data["name"].strip()
+    if "username" in update_data:
+        tenant.username = update_data["username"].strip() if update_data["username"] else None
+    if "password" in update_data:
+        tenant.set_password(update_data["password"])
+    if "token" in update_data or "refresh_token" in update_data:
+        current_tok = tenant.get_token()
+        current_ref = tenant.get_refresh_token()
+        new_tok = update_data.get("token", current_tok)
+        new_ref = update_data.get("refresh_token", current_ref)
+        tenant.set_tokens(new_tok, new_ref)
+    if "custom_metadata" in update_data:
+        tenant.custom_metadata = update_data["custom_metadata"]
+    if "is_active" in update_data and update_data["is_active"] is not None:
+        tenant.is_active = update_data["is_active"]
 
-    update_data["updated_at"] = datetime.now(timezone.utc)
-
-    for field, val in update_data.items():
-        setattr(tenant, field, val)
-
+    tenant.updated_at = datetime.now(timezone.utc)
     await tenant.save()
     return _to_tenant_response(tenant)
 
@@ -450,10 +466,10 @@ async def test_tenant_connection(
 
     client = ThingsBoardClient(
         base_url=server.base_url,
-        token=tenant.token,
-        refresh_token=tenant.refresh_token,
+        token=tenant.get_token(),
+        refresh_token=tenant.get_refresh_token(),
         username=tenant.username,
-        password=tenant.password
+        password=tenant.get_password()
     )
 
     result = await client.test_connection()

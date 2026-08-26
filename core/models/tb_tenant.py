@@ -4,23 +4,25 @@ from beanie import Document, Link
 from pydantic import Field
 
 from core.models.tb_server import TBServer
+from core.crypto import encrypt_data, decrypt_data
 
 
 class TBTenant(Document):
     """
     Modelo de Documento Beanie para la persistencia de Tenants individuales dentro de un TBServer.
     Almacena las credenciales de Tenant Admin, tokens JWT de sesión y metadatos específicos por Tenant.
+    Todas las credenciales y tokens se almacenan cifrados con Fernet en reposo (MongoDB).
     """
     server_id: Link[TBServer] = Field(..., description="Referencia/Link al servidor ThingsBoard padre")
     name: str = Field(..., description="Nombre del tenant")
     
-    # Credenciales del Tenant Admin en ThingsBoard
+    # Credenciales del Tenant Admin en ThingsBoard (username en texto plano, contraseña cifrada)
     username: Optional[str] = Field(default=None, description="Usuario / Email del Tenant Admin en ThingsBoard")
-    password: Optional[str] = Field(default=None, description="Contraseña del Tenant Admin en ThingsBoard")
+    encrypted_password: Optional[str] = Field(default=None, description="Contraseña cifrada (Fernet) del Tenant Admin en ThingsBoard")
     
-    # Tokens JWT de sesión con ThingsBoard
-    token: Optional[str] = Field(default=None, description="Token JWT de acceso a ThingsBoard")
-    refresh_token: Optional[str] = Field(default=None, description="Refresh Token de ThingsBoard")
+    # Tokens JWT de sesión con ThingsBoard cifrados
+    encrypted_token: Optional[str] = Field(default=None, description="Token JWT de acceso cifrado (Fernet) a ThingsBoard")
+    encrypted_refresh_token: Optional[str] = Field(default=None, description="Refresh Token cifrado (Fernet) de ThingsBoard")
 
     # Metadatos dinámicos específicos del Tenant
     custom_metadata: Dict[str, Any] = Field(default_factory=dict, description="Metadatos variables específicos del tenant")
@@ -40,6 +42,56 @@ class TBTenant(Document):
             "user_id",
             "name"
         ]
+
+    # ==========================================
+    # Getters y Setters Seguros (Fernet RAM Decryption)
+    # ==========================================
+
+    def set_password(self, plain_password: Optional[str]) -> None:
+        """
+        Cifra y asigna la contraseña del Tenant Admin antes de persistir en MongoDB.
+        """
+        if plain_password:
+            self.encrypted_password = encrypt_data(plain_password)
+        else:
+            self.encrypted_password = None
+
+    def get_password(self) -> Optional[str]:
+        """
+        Descifra y retorna la contraseña del Tenant Admin en memoria RAM.
+        """
+        if self.encrypted_password:
+            return decrypt_data(self.encrypted_password)
+        return None
+
+    def set_tokens(self, token: Optional[str], refresh_token: Optional[str] = None) -> None:
+        """
+        Cifra y asigna los tokens JWT de ThingsBoard antes de persistir en MongoDB.
+        """
+        if token is not None:
+            self.encrypted_token = encrypt_data(token) if token else None
+        if refresh_token is not None:
+            self.encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else None
+
+    def get_token(self) -> Optional[str]:
+        """
+        Descifra y retorna el token JWT de acceso a ThingsBoard en memoria RAM.
+        """
+        if self.encrypted_token:
+            return decrypt_data(self.encrypted_token)
+        return None
+
+    def get_refresh_token(self) -> Optional[str]:
+        """
+        Descifra y retorna el refresh token de ThingsBoard en memoria RAM.
+        """
+        if self.encrypted_refresh_token:
+            return decrypt_data(self.encrypted_refresh_token)
+        return None
+
+    # ==========================================
+    # Métodos de Resolución Jerárquica
+    # ==========================================
 
     async def get_server(self) -> Optional[TBServer]:
         """
