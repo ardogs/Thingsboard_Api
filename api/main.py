@@ -11,6 +11,7 @@ from api.endpoints.iam import router as iam_router
 from api.endpoints.servers import router as servers_router
 from api.endpoints.telemetry import router as telemetry_router
 from api.endpoints.devices import router as devices_router
+from api.endpoints.scheduler import router as scheduler_router
 from api.middlewares.audit_log import AuditLogMiddleware
 
 
@@ -45,6 +46,7 @@ app.include_router(iam_router, prefix="/api/v1/iam", tags=["IAM y Políticas Cas
 app.include_router(servers_router, prefix="/api/v1/servers", tags=["Servidores ThingsBoard"])
 app.include_router(telemetry_router, prefix="/api/v1/telemetry", tags=["Telemetría"])
 app.include_router(devices_router, prefix="/api/v1/devices", tags=["Dispositivos y Aprovisionamiento"])
+app.include_router(scheduler_router, prefix="/api/v1/scheduler/tasks", tags=["Scheduler y Tareas Programadas"])
 
 # Compatibilidad con rutas v0 / legacy
 app.include_router(auth_router, prefix="/api/auth", include_in_schema=False)

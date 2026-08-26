@@ -9,6 +9,7 @@ from core.models.tb_server import TBServer
 from core.models.tb_tenant import TBTenant
 from core.models.tb_backup import TBBackup
 from core.models.audit_log import AuditLog
+from core.models.tb_scheduled_task import TBScheduledTask
 from core.logger import logger
 
 _mongo_client: Optional[AsyncIOMotorClient] = None
@@ -17,7 +18,7 @@ _database_name: Optional[str] = None
 
 async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_name: Optional[str] = None):
     """
-    Inicializa la conexión con MongoDB e inicializa Beanie ODM con los modelos de documentos registrados (User, TBServer, TBTenant, TBBackup).
+    Inicializa la conexión con MongoDB e inicializa Beanie ODM con los modelos de documentos registrados (User, TBServer, TBTenant, TBBackup, AuditLog, TBScheduledTask).
     Detecta automáticamente si el cliente actual pertenece a un event loop cerrado o diferente y lo recrea para evitar errores de 'Event loop is closed'.
     Permite inyectar un cliente personalizado (ej. para pruebas con mongomock_motor).
     """
@@ -60,10 +61,11 @@ async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_n
             TBServer,
             TBTenant,
             TBBackup,
-            AuditLog
+            AuditLog,
+            TBScheduledTask
         ]
     )
-    logger.info("[MongoDB] Beanie ODM inicializado exitosamente con los modelos User, TBServer, TBTenant, TBBackup y AuditLog.")
+    logger.info("[MongoDB] Beanie ODM inicializado exitosamente con los modelos User, TBServer, TBTenant, TBBackup, AuditLog y TBScheduledTask.")
 
 
 async def close_db():
