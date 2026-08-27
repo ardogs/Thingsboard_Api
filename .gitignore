@@ -9,4 +9,4 @@ backups/*
 scripts
 venv
 .env
-celery*
+celerybeat*

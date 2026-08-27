@@ -28,6 +28,11 @@ from core.services.telemetry_service import (
     get_user_stream_channel,
     get_user_registry_key
 )
+from core.services.incremental_backup_service import (
+    calculate_previous_month_boundaries,
+    run_schedule_monthly_incremental_backups,
+    run_incremental_tenant_backup
+)
 
 celery_app = Celery("telemetry_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
@@ -39,6 +44,9 @@ celery_app.conf.update(
     broker_transport_options={"visibility_timeout": 864000},  # 10 días (864,000s) para evitar reentregas prematuras en Redis
     task_acks_late=True,                                      # Acknowledgment tardío tras completar la ejecución
     worker_prefetch_multiplier=1,                             # Prefetch de 1 tarea a la vez por worker
+    task_routes={
+        "tasks.execute_incremental_tenant_backup": {"queue": "incremental_backups"}
+    },
     beat_schedule={
         "master_dispatcher_task": {
             "task": "tasks.master_dispatcher",
@@ -468,5 +476,51 @@ def cleanup_old_backups_task(days_to_keep: int = 30) -> dict:
     except Exception as exc:
         logger.error(f"[Celery Worker] Error fatal en ejecución de cleanup_old_backups: {exc}", exc_info=True)
         raise exc
+
+
+@celery_app.task(name="tasks.schedule_monthly_incremental_backups")
+def schedule_monthly_incremental_backups_task() -> dict:
+    """
+    Orquestador maestro periódico para el cálculo de fronteras del mes vencido
+    y despacho secuencial de respaldos incrementales por Tenant hacia la cola 'incremental_backups'.
+    """
+    logger.info("[Celery Orchestrator] Iniciando orquestación de respaldos incrementales mensuales...")
+    try:
+        return _run_sync_in_worker(run_schedule_monthly_incremental_backups(celery_app_instance=celery_app))
+    except Exception as exc:
+        logger.error(f"[Celery Orchestrator] Error fatal despachando respaldos incrementales: {exc}", exc_info=True)
+        raise exc
+
+
+@celery_app.task(name="tasks.execute_incremental_tenant_backup", bind=True, max_retries=5)
+def execute_incremental_tenant_backup_task(self, payload: dict) -> dict:
+    """
+    Worker de Celery para la descarga incremental de telemetría por Tenant ("Mes Vencido").
+    Enrutado a la cola 'incremental_backups'.
+    Ejecuta descargas concurrentes de llaves con semáforos, streaming JSON y reintentos ante fallos.
+    """
+    task_id = self.request.id
+    tenant_id = payload.get("tenant_id", "unknown_tenant")
+    tenant_name = payload.get("tenant_name", "default")
+    logger.info(f"[Celery Worker] Ejecutando respaldo incremental {task_id} para Tenant '{tenant_name}' ({tenant_id})")
+
+    try:
+        return _run_sync_in_worker(run_incremental_tenant_backup(payload))
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        logger.error(f"[Celery Worker] Fallo transitorio de red en tarea incremental {task_id}: {exc}. Reintentando...")
+        countdown = 2 ** min(self.request.retries, 5)
+        raise self.retry(exc=exc, countdown=countdown)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (429, 500, 502, 503, 504):
+            logger.error(f"[Celery Worker] Error HTTP transitorio ({exc.response.status_code}) en tarea incremental {task_id}. Reintentando...")
+            countdown = 2 ** min(self.request.retries, 5)
+            raise self.retry(exc=exc, countdown=countdown)
+        else:
+            logger.error(f"[Celery Worker] Error HTTP cliente ({exc.response.status_code}) no recuperable en tarea incremental {task_id}: {exc}")
+            raise exc
+    except Exception as exc:
+        logger.error(f"[Celery Worker] Error fatal en tarea incremental {task_id}: {exc}", exc_info=True)
+        raise exc
+
 
 

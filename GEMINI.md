@@ -18,6 +18,7 @@
 11. **Distributed Lock & Heartbeat para Tareas Multi-Día:** Candado distribuido en Redis (`tb_server_lock:{server_id}`) con Fail Fast (HTTP 409 Conflict) en FastAPI, latido asíncrono (Heartbeat) de renovación cada 30 min (TTL 1 hora) en el Celery Worker y `visibility_timeout` de 10 días (`864,000s`) para descargas ininterrumpidas de larga duración (6 a 8 días).
 12. **Automatizaciones y Patrón Dispatcher con Celery Beat (`TBScheduledTask`):** Programación dinámica de tareas en base de datos sin alterar código fuente, resolución periódica cada 1 min (`tasks.master_dispatcher`), conversión de zonas horarias locales (`America/Mexico_City`) a UTC puro, aislamiento granular ante fallos y disparo manual bajo demanda.
 13. **Política de Retención y Limpieza Automatizada de Disco (`tasks.cleanup_old_backups`):** Sincronización estricta con el catálogo `TBBackup` en MongoDB, purga defensiva de archivos ZIP caducados (`days_to_keep`) y barrido de directorios temporales huérfanos/zombis (`tmp_*` con antigüedad mayor a 24 horas).
+14. **Data Lake de Respaldos Incrementales de Mes Vencido (`tasks.schedule_monthly_incremental_backups` y `tasks.execute_incremental_tenant_backup`):** Orquestación mensual secuencial por Tenant hacia la cola `incremental_backups`, cálculo estricto de fronteras temporales en milisegundos con `ZoneInfo(settings.APP_TIMEZONE)`, concurrencia interna de hasta 4 llaves con `asyncio.Semaphore`, resiliencia extrema con `tenacity` (reintentos ante 429, 500, 502, 503, 504, ReadTimeout y auto-renovación en 401), streaming de JSON sin sobreescritura a `.parcial.json` e idempotencia con `.completo.json` en `tenant_backups/<TENANT>/<DEVICE>/<AÑO>/<MES>/`.
 
 ---
 
@@ -174,7 +175,8 @@ Thingsboard_Api/
 │   │   └── audit_log.py               # Modelo AuditLog (Trazabilidad DevSecOps con payloads sanitizados)
 │   └── services/                      # Servicios de negocio y lógica pesada desacoplada
 │       ├── __init__.py
-│       └── telemetry_service.py       # Descarga masiva en tmp_{task_id}, checkpoints, catálogo TBBackup y ZIP
+│       ├── telemetry_service.py       # Descarga masiva en tmp_{task_id}, checkpoints, catálogo TBBackup y ZIP
+│       └── incremental_backup_service.py # Data Lake de respaldos incrementales (mes vencido), tenacity, semáforos y streaming JSON
 ├── workers/                           # Procesamiento asíncrono en segundo plano
 │   ├── __init__.py
 │   └── tasks.py                       # Enrutador ligero de Celery (resuelve tenant_id y server en Mongo, Lock y Heartbeat)
@@ -189,6 +191,7 @@ Thingsboard_Api/
 │   ├── verify_celery_beat_dispatcher.py # Suite de verificación de Celery Beat, Dispatcher y Timezones
 │   ├── verify_cleanup_old_backups.py  # Suite de verificación de retención de respaldos y barrido de temporales zombis
 │   ├── verify_scheduler_endpoints.py  # Suite de verificación de endpoints HTTP del Scheduler y validación croniter
+│   ├── verify_incremental_backups.py  # Suite de verificación de Data Lake incremental (mes vencido), tenacity y streaming JSON
 │   └── BackupManager/                 # Herramienta standalone en Node.js para respaldos manuales
 │       ├── backups/                   # Carpeta de salida de respaldos generados por Node.js
 │       ├── helpers/
@@ -198,6 +201,7 @@ Thingsboard_Api/
 │       ├── package.json               # Dependencias de Node.js (axios, dotenv, luxon, winston)
 │       └── README.md                  # Documentación específica del BackupManager de Node.js
 ├── backups/                           # Directorio unificado para archivos ZIP generados y temporales aislados
+├── tenant_backups/                    # Data Lake persistente organizado por tenant/device/año/mes en streaming JSON
 ├── logs/                              # Directorio de logs de la aplicación Python (telemetry.log)
 ├── docker-compose.yml                 # Archivo para orquestación de contenedores (MongoDB, Redis, API, Worker)
 ├── requirements.txt                   # Dependencias de Python
@@ -872,6 +876,9 @@ venv\Scripts\python scripts/verify_cleanup_old_backups.py
 
 # 10. Probar Endpoints HTTP del Scheduler (/api/v1/scheduler/tasks), Validación croniter y RBAC
 venv\Scripts\python scripts/verify_scheduler_endpoints.py
+
+# 11. Probar Data Lake de Respaldos Incrementales (Mes Vencido), Tenacity, Semáforos y Streaming JSON
+venv\Scripts\python scripts/verify_incremental_backups.py
 ```
 
 ---
