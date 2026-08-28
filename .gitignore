@@ -10,3 +10,4 @@ scripts
 venv
 .env
 celerybeat*
+tenant_backups/*

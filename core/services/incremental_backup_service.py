@@ -4,6 +4,7 @@ import json
 import calendar
 import asyncio
 import httpx
+import aiofiles
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any, Tuple
@@ -22,6 +23,7 @@ from core.models.tb_tenant import TBTenant
 from core.models.tb_server import TBServer
 from core.tb_client import ThingsBoardClient
 from core.logger import logger
+from core.io_limiter import async_replace_file, async_remove_file
 from core.services.telemetry_service import (
     sanitize_name,
     refresh_tenant_tokens_in_db
@@ -172,89 +174,95 @@ async def download_incremental_key_telemetry(
         current_ts = start_ts
         total_records_written = 0
 
-        # Escritura en streaming directo a disco para prevenir OOM
-        with open(partial_file_path, "w", encoding="utf-8") as f:
-            f.write('{\n  "data": [\n')
-            first_record = True
+        # Escritura en streaming asíncrono directo a disco con aiofiles para prevenir OOM
+        try:
+            async with aiofiles.open(partial_file_path, "w", encoding="utf-8") as f:
+                await f.write('{\n  "data": [\n')
+                first_record = True
 
-            while current_ts < end_ts:
-                try:
-                    data = await fetch_telemetry_page_with_retry(
-                        tb=tb,
-                        token=token_ref[0],
-                        entity_id=entity_id,
-                        keys=key,
-                        start_ts=current_ts,
-                        end_ts=end_ts,
-                        entity_type=entity_type,
-                        limit=page_limit
-                    )
-                except httpx.HTTPStatusError as e:
-                    # Manejo de token expirado en vuelo (HTTP 401)
-                    if e.response.status_code == 401:
-                        logger.warning(f"[Incremental Key] 401 detectado en '{key}'. Renovando token de acceso...")
-                        await refresh_tenant_tokens_in_db(
-                            tenant_id=tenant_id,
+                while current_ts < end_ts:
+                    try:
+                        data = await fetch_telemetry_page_with_retry(
                             tb=tb,
-                            token_ref=token_ref,
-                            payload=payload
+                            token=token_ref[0],
+                            entity_id=entity_id,
+                            keys=key,
+                            start_ts=current_ts,
+                            end_ts=end_ts,
+                            entity_type=entity_type,
+                            limit=page_limit
                         )
-                        continue
-                    else:
-                        logger.error(f"[Incremental Key] Error HTTP {e.response.status_code} no recuperable en '{key}': {e}")
+                    except httpx.HTTPStatusError as e:
+                        # Manejo de token expirado en vuelo (HTTP 401)
+                        if e.response.status_code == 401:
+                            logger.warning(f"[Incremental Key] 401 detectado en '{key}'. Renovando token de acceso...")
+                            await refresh_tenant_tokens_in_db(
+                                tenant_id=tenant_id,
+                                tb=tb,
+                                token_ref=token_ref,
+                                payload=payload
+                            )
+                            continue
+                        else:
+                            logger.error(f"[Incremental Key] Error HTTP {e.response.status_code} no recuperable en '{key}': {e}")
+                            raise
+                    except Exception as exc:
+                        logger.error(f"[Incremental Key] Fallo al consultar telemetría para '{device_name}' ({key}): {exc}")
                         raise
-                except Exception as exc:
-                    logger.error(f"[Incremental Key] Fallo al consultar telemetría para '{device_name}' ({key}): {exc}")
-                    raise
 
-                records = []
-                if data:
-                    if key in data and isinstance(data[key], list):
-                        records = data[key]
-                    else:
-                        for k, v in data.items():
-                            if k.lower() == key.lower() and isinstance(v, list):
-                                records = v
-                                break
-                        if not records and len(data) == 1:
-                            first_val = list(data.values())[0]
-                            if isinstance(first_val, list):
-                                records = first_val
+                    records = []
+                    if data:
+                        if key in data and isinstance(data[key], list):
+                            records = data[key]
+                        else:
+                            for k, v in data.items():
+                                if k.lower() == key.lower() and isinstance(v, list):
+                                    records = v
+                                    break
+                            if not records and len(data) == 1:
+                                first_val = list(data.values())[0]
+                                if isinstance(first_val, list):
+                                    records = first_val
 
-                if not records:
-                    logger.debug(f"[{month_str}-{year_str}] Sin más registros para '{device_name}' ({key}) desde ts={current_ts}")
-                    break
+                    if not records:
+                        logger.debug(f"[{month_str}-{year_str}] Sin más registros para '{device_name}' ({key}) desde ts={current_ts}")
+                        break
 
-                # Ordenar registros ascendentemente por timestamp
-                records = sorted(records, key=lambda x: x.get("ts", 0))
+                    # Ordenar registros ascendentemente por timestamp
+                    records = sorted(records, key=lambda x: x.get("ts", 0))
 
-                for rec in records:
-                    if not first_record:
-                        f.write(",\n")
-                    f.write("    " + json.dumps(rec, ensure_ascii=False))
-                    first_record = False
-                    total_records_written += 1
+                    for rec in records:
+                        if not first_record:
+                            await f.write(",\n")
+                        await f.write("    " + json.dumps(rec, ensure_ascii=False))
+                        first_record = False
+                        total_records_written += 1
 
-                # Avanzar puntero de tiempo
-                last_record_ts = records[-1]["ts"]
-                next_ts = max(current_ts + 1, last_record_ts + 1)
-                current_ts = next_ts
+                    # Avanzar puntero de tiempo
+                    last_record_ts = records[-1]["ts"]
+                    next_ts = max(current_ts + 1, last_record_ts + 1)
+                    current_ts = next_ts
 
-                if len(records) < page_limit:
-                    break
+                    if len(records) < page_limit:
+                        break
 
-            # Cierre de la estructura JSON inyectando el length
-            f.write(f'\n  ],\n  "length": {total_records_written}\n}}\n')
+                # Cierre de la estructura JSON inyectando el length
+                await f.write(f'\n  ],\n  "length": {total_records_written}\n}}\n')
 
-        # Renombrar atómicamente a .completo.json una vez garantizada la completitud
-        if os.path.exists(partial_file_path):
-            if os.path.exists(final_file_path):
+            # Renombrar atómicamente a .completo.json una vez garantizada la completitud
+            if os.path.exists(partial_file_path):
+                await async_replace_file(partial_file_path, final_file_path)
+                logger.info(f"[{month_str}-{year_str}] - '{device_name}' ({key}): {total_records_written} registros completados en {final_file_name}")
+
+        except Exception as exc:
+            # Integridad Transaccional: Purgar archivo parcial corrupto en caso de error
+            if os.path.exists(partial_file_path):
                 try:
-                    os.remove(final_file_path)
+                    await async_remove_file(partial_file_path, ignore_errors=True)
+                    logger.info(f"[Transactional Cleanup] Archivo parcial corrupto '{partial_file_path}' purgado tras error.")
                 except Exception:
                     pass
-            os.replace(partial_file_path, final_file_path)
-            logger.info(f"[{month_str}-{year_str}] - '{device_name}' ({key}): {total_records_written} registros completados en {final_file_name}")
+            raise exc
 
         return {
             "status": "DOWNLOADED",
@@ -444,67 +452,3 @@ async def run_incremental_tenant_backup(payload: dict) -> dict:
         f"Fallidos: {summary['failed_keys']}, Total Registros: {summary['total_records']}"
     )
     return summary
-
-
-async def run_schedule_monthly_incremental_backups(celery_app_instance=None) -> dict:
-    """
-    Orquestador maestro periódico (ejecutado al inicio de mes o bajo demanda):
-    1. Calcula el rango de tiempo del mes calendario anterior en la zona horaria local (America/Mexico_City).
-    2. Consulta en MongoDB todos los TBTenant activos.
-    3. Despacha secuencialmente una tarea 'tasks.execute_incremental_tenant_backup' por cada tenant hacia la cola 'incremental_backups'.
-    """
-    await init_db()
-
-    start_dt, end_dt, start_ts, end_ts, year_str, month_str = calculate_previous_month_boundaries()
-
-    logger.info(
-        f"[Monthly Orchestrator] Calculadas fronteras del mes anterior ({month_str}-{year_str}): "
-        f"Desde {start_dt.isoformat()} (ts={start_ts}) Hasta {end_dt.isoformat()} (ts={end_ts})"
-    )
-
-    active_tenants = await TBTenant.find(TBTenant.is_active == True).to_list()
-    logger.info(f"[Monthly Orchestrator] Se identificaron {len(active_tenants)} Tenants activos en MongoDB.")
-
-    dispatched = []
-
-    for tenant in active_tenants:
-        tenant_id = str(tenant.id)
-        payload = {
-            "tenant_id": tenant_id,
-            "tenant_name": tenant.name,
-            "start_ts": start_ts,
-            "end_ts": end_ts,
-            "year_str": year_str,
-            "month_str": month_str,
-            "start_date": start_dt.isoformat(),
-            "end_date": end_dt.isoformat(),
-            "time_zone": settings.APP_TIMEZONE,
-            "concurrency_limit": 4,
-            "page_limit": 2000
-        }
-
-        task_id = "mock_task_id"
-        if celery_app_instance:
-            res = celery_app_instance.send_task(
-                "tasks.execute_incremental_tenant_backup",
-                kwargs={"payload": payload},
-                queue="incremental_backups"
-            )
-            task_id = res.id if res else "dispatched"
-
-        dispatched.append({
-            "tenant_id": tenant_id,
-            "tenant_name": tenant.name,
-            "task_id": task_id
-        })
-        logger.info(f"[Monthly Orchestrator] Encolado respaldo incremental para Tenant '{tenant.name}' (Celery Task ID: {task_id})")
-
-    return {
-        "status": "SUCCESS",
-        "month_str": month_str,
-        "year_str": year_str,
-        "start_ts": start_ts,
-        "end_ts": end_ts,
-        "total_dispatched": len(dispatched),
-        "tenants": dispatched
-    }

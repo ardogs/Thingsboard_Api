@@ -1,7 +1,7 @@
-version: '3.8'
-
 services:
-  # 1. Base de Datos
+  # ----------------------------------------------------------------------------
+  # 1. Base de Datos MongoDB
+  # ----------------------------------------------------------------------------
   mongo:
     image: mongo:7.0
     container_name: tb_mongo
@@ -9,8 +9,19 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+    networks:
+      - tb_network
 
+  # ----------------------------------------------------------------------------
+  # 2. Redis Cache & ARQ Broker
+  # ----------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     container_name: tb_redis
@@ -19,9 +30,23 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped
+    networks:
+      - tb_network
+
+  # ----------------------------------------------------------------------------
+  # 3. FastAPI API Gateway
+  # ----------------------------------------------------------------------------
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: tb_api
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     ports:
@@ -29,50 +54,80 @@ services:
     env_file:
       - .env
     volumes:
-      - ./backups:/app/backups 
+      - ./backups:/app/backups
+      - ./tenant_backups:/app/tenant_backups
+      - ./logs:/app/logs
     depends_on:
-      - mongo
-      - redis
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
+    networks:
+      - tb_network
 
+  # ----------------------------------------------------------------------------
+  # 4. Worker ARQ Principal (Procesamiento y Cron Integrado - 5 Réplicas)
+  # ----------------------------------------------------------------------------
   worker_default:
-    build: .
-    container_name: tb_worker_default
-    command: celery -A workers.tasks.celery_app worker --loglevel=info -c 4
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: arq workers.arq_settings.WorkerSettings
+    deploy:
+      replicas: 5
     env_file:
       - .env
     volumes:
       - ./backups:/app/backups
+      - ./tenant_backups:/app/tenant_backups
+      - ./logs:/app/logs
     depends_on:
-      - mongo
-      - redis
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+    networks:
+      - tb_network
 
+  # ----------------------------------------------------------------------------
+  # 5. Worker ARQ para Respaldos Incrementales
+  # ----------------------------------------------------------------------------
   worker_incremental:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: tb_worker_incremental
-
-    command: celery -A workers.tasks.celery_app worker -Q incremental_backups -c 1 --loglevel=info
+    command: arq workers.arq_settings.IncrementalWorkerSettings
     env_file:
       - .env
     volumes:
       - ./backups:/app/backups
+      - ./tenant_backups:/app/tenant_backups
+      - ./logs:/app/logs
     depends_on:
-      - mongo
-      - redis
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
-
-  beat:
-    build: .
-    container_name: tb_beat
-    command: celery -A workers.tasks.celery_app beat --loglevel=info
-    env_file:
-      - .env
-    depends_on:
-      - mongo
-      - redis
-    restart: unless-stopped
+    networks:
+      - tb_network
 
 volumes:
   mongo_data:
+    name: tb_mongo_data
   redis_data:
+    name: tb_redis_data
+
+networks:
+  tb_network:
+    name: tb_network
+    driver: bridge

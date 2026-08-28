@@ -1,0 +1,46 @@
+# Entornos virtuales
+venv/
+env/
+.venv/
+ENV/
+
+# Archivos de caché y bytecode de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs y bases de datos locales temporales
+logs/*.log
+*.log
+celerybeat-schedule*
+
+# Almacenamiento local de respaldos y temporales de trabajo
+backups/tmp_*
+backups/*.zip
+tenant_backups/
+test_backups_sandbox/
+test_tenant_backups_sandbox/
+test_io_workspace/
+
+# Control de versiones y editores
+.git/
+.gitignore
+.dockerignore
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Documentos y artefactos temporales
+tmp/
+temp/

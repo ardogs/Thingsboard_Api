@@ -2,11 +2,14 @@ from core.services.telemetry_service import (
     run_download_orchestrator,
     publish_task_status,
     get_user_stream_channel,
-    get_user_registry_key
+    get_user_registry_key,
+    calculate_telemetry_delta_plan,
+    get_highest_ts_from_partial_file,
+    read_local_telemetry_stream,
+    fetch_remote_telemetry_range
 )
 from core.services.incremental_backup_service import (
     calculate_previous_month_boundaries,
-    run_schedule_monthly_incremental_backups,
     run_incremental_tenant_backup
 )
 
@@ -15,7 +18,10 @@ __all__ = [
     "publish_task_status",
     "get_user_stream_channel",
     "get_user_registry_key",
+    "calculate_telemetry_delta_plan",
+    "get_highest_ts_from_partial_file",
+    "read_local_telemetry_stream",
+    "fetch_remote_telemetry_range",
     "calculate_previous_month_boundaries",
-    "run_schedule_monthly_incremental_backups",
     "run_incremental_tenant_backup"
 ]

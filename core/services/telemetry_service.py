@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any, Tuple
 
+import aiofiles
+import ijson
 import redis.asyncio as redis
 from beanie import PydanticObjectId
 
@@ -17,6 +19,12 @@ from core.models.tb_tenant import TBTenant
 from core.models.tb_backup import TBBackup
 from core.tb_client import ThingsBoardClient
 from core.logger import logger
+from core.io_limiter import (
+    async_create_zip_archive,
+    async_rmtree,
+    async_remove_file,
+    get_zip_semaphore
+)
 
 
 def sanitize_name(name: str) -> str:
@@ -228,6 +236,287 @@ async def refresh_tenant_tokens_in_db(
     return new_token, new_refresh_token
 
 
+def _sync_get_highest_ts(file_path: str) -> Optional[int]:
+    """
+    Lee iterativamente un archivo JSON con ijson para encontrar el ts máximo sin cargar el archivo a RAM.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return None
+    max_ts = None
+    try:
+        with open(file_path, "rb") as f:
+            for item in ijson.items(f, "data.item", use_float=True):
+                if isinstance(item, dict):
+                    ts = item.get("ts")
+                    if ts is not None:
+                        try:
+                            parsed_ts = int(ts)
+                            if max_ts is None or parsed_ts > max_ts:
+                                max_ts = parsed_ts
+                        except (ValueError, TypeError):
+                            pass
+    except Exception as e:
+        logger.warning(f"[ijson] Error extrayendo highest_ts de '{file_path}': {e}")
+    return max_ts
+
+
+def _sync_read_records_in_range(file_path: str, start_ts: int, end_ts: int) -> List[dict]:
+    """
+    Lee iterativamente con ijson los registros dentro del rango [start_ts, end_ts].
+    Descarta registros fuera del rango sin acumularlos en memoria.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return []
+    records = []
+    try:
+        with open(file_path, "rb") as f:
+            for item in ijson.items(f, "data.item", use_float=True):
+                if isinstance(item, dict):
+                    ts = item.get("ts")
+                    if ts is not None:
+                        try:
+                            parsed_ts = int(ts)
+                            if start_ts <= parsed_ts <= end_ts:
+                                records.append(item)
+                            elif parsed_ts > end_ts:
+                                # Los registros están en orden cronológico ascendente
+                                break
+                        except (ValueError, TypeError):
+                            pass
+    except Exception as e:
+        logger.warning(f"[ijson] Error leyendo registros en rango [{start_ts} -> {end_ts}] de '{file_path}': {e}")
+    return records
+
+
+async def get_highest_ts_from_partial_file(file_path: str) -> Optional[int]:
+    """
+    Wrapper asíncrono no bloqueante para extraer el timestamp máximo de un archivo parcial.
+    """
+    return await asyncio.to_thread(_sync_get_highest_ts, file_path)
+
+
+async def read_local_telemetry_stream(file_path: str, start_ts: int, end_ts: int) -> List[dict]:
+    """
+    Wrapper asíncrono no bloqueante para leer registros de telemetría locales en un sub-rango.
+    """
+    return await asyncio.to_thread(_sync_read_records_in_range, file_path, start_ts, end_ts)
+
+
+async def calculate_telemetry_delta_plan(
+    tenant_name: str,
+    device_name: str,
+    entity_id: str,
+    key: str,
+    interval: dict,
+    base_storage_dir: str = "tenant_backups"
+) -> dict:
+    """
+    Motor de Intersección (Delta Calculator):
+    Compara el rango solicitado [interval['start_ts'], interval['end_ts']] con los archivos existentes en:
+    tenant_backups/<TENANT>/<DEVICE>/<AÑO>/<MES>/
+
+    Retorna un diccionario con el plan de ejecución:
+    {
+        "plan_type": "FULL_LOCAL" | "HYBRID" | "FULL_REMOTE",
+        "local_file": Optional[str],
+        "local_start_ts": Optional[int],
+        "local_end_ts": Optional[int],
+        "remote_start_ts": Optional[int],
+        "remote_end_ts": Optional[int],
+        "max_local_ts": Optional[int]
+    }
+    """
+    safe_tenant = sanitize_name(tenant_name)
+    safe_device = sanitize_name(device_name)
+    safe_key = sanitize_name(key)
+    year_str = interval["year_str"]
+    month_str = interval["month_str"]
+    req_start = interval["start_ts"]
+    req_end = interval["end_ts"]
+
+    dir_path = os.path.join(base_storage_dir, safe_tenant, safe_device, year_str, month_str)
+
+    completo_candidates = [
+        os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}.completo.json"),
+        os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}_completo.json")
+    ]
+    completo_file = None
+    for cand in completo_candidates:
+        if os.path.exists(cand):
+            completo_file = cand
+            break
+
+    # 1. Caso A: Archivo .completo.json existe
+    if completo_file:
+        return {
+            "plan_type": "FULL_LOCAL",
+            "local_file": completo_file,
+            "local_start_ts": req_start,
+            "local_end_ts": req_end,
+            "remote_start_ts": None,
+            "remote_end_ts": None,
+            "max_local_ts": None
+        }
+
+    # 2. Caso B: Archivo .parcial.json existe
+    parcial_candidates = [
+        os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}.parcial.json"),
+        os.path.join(dir_path, f"{entity_id}.{safe_key}.{month_str}-{year_str}_parcial.json")
+    ]
+    parcial_file = None
+    for cand in parcial_candidates:
+        if os.path.exists(cand):
+            parcial_file = cand
+            break
+
+    if parcial_file:
+        max_ts = await get_highest_ts_from_partial_file(parcial_file)
+        if max_ts is not None:
+            # Si el archivo parcial cubre hasta o más allá del final solicitado:
+            if max_ts >= req_end:
+                return {
+                    "plan_type": "FULL_LOCAL",
+                    "local_file": parcial_file,
+                    "local_start_ts": req_start,
+                    "local_end_ts": req_end,
+                    "remote_start_ts": None,
+                    "remote_end_ts": None,
+                    "max_local_ts": max_ts
+                }
+            # Si el archivo parcial cubre una porción intermedia [req_start, max_ts]:
+            elif req_start <= max_ts < req_end:
+                return {
+                    "plan_type": "HYBRID",
+                    "local_file": parcial_file,
+                    "local_start_ts": req_start,
+                    "local_end_ts": max_ts,
+                    "remote_start_ts": max_ts + 1,
+                    "remote_end_ts": req_end,
+                    "max_local_ts": max_ts
+                }
+            # Si max_ts es menor que req_start, el archivo parcial termina antes del rango solicitado
+            else:
+                return {
+                    "plan_type": "FULL_REMOTE",
+                    "local_file": None,
+                    "local_start_ts": None,
+                    "local_end_ts": None,
+                    "remote_start_ts": req_start,
+                    "remote_end_ts": req_end,
+                    "max_local_ts": max_ts
+                }
+
+    # 3. Caso C: No existe ningún archivo previo en disco
+    return {
+        "plan_type": "FULL_REMOTE",
+        "local_file": None,
+        "local_start_ts": None,
+        "local_end_ts": None,
+        "remote_start_ts": req_start,
+        "remote_end_ts": req_end,
+        "max_local_ts": None
+    }
+
+
+async def fetch_remote_telemetry_range(
+    tb: ThingsBoardClient,
+    token_ref: list,
+    entity_id: str,
+    entity_type: str,
+    key: str,
+    start_ts: int,
+    end_ts: int,
+    page_limit: int,
+    tenant_id: Optional[str],
+    tenant_name: str,
+    device_name: str,
+    payload: dict,
+    local_redis: redis.Redis,
+    cache_key: str,
+    force_reload: bool = False
+) -> List[dict]:
+    """
+    Descarga registros de telemetría de ThingsBoard REST API para el sub-rango [start_ts, end_ts].
+    Soporta auto-renovación de tokens en vuelo (HTTP 401), paginación continua y checkpoints en Redis.
+    """
+    current_ts = start_ts
+    if not force_reload:
+        last_saved_ts = await local_redis.get(cache_key)
+        if last_saved_ts:
+            try:
+                parsed_ts = int(last_saved_ts)
+                if start_ts <= parsed_ts < end_ts:
+                    current_ts = parsed_ts
+            except (ValueError, TypeError):
+                pass
+
+    remote_records: List[dict] = []
+    logger.info(f"[{device_name}] [REST API] Consultando '{key}' en rango [{current_ts} -> {end_ts}]")
+
+    while current_ts < end_ts:
+        try:
+            data = await tb.get_entity_telemetry(
+                token=token_ref[0],
+                entity_type=entity_type,
+                entity_id=entity_id,
+                keys=key,
+                start_ts=current_ts,
+                end_ts=end_ts,
+                limit=page_limit
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                logger.warning(f"[Telemetry Key] 401 detectado al descargar '{key}'. Ejecutando auto-renovación en vuelo...")
+                await refresh_tenant_tokens_in_db(
+                    tenant_id=tenant_id,
+                    tb=tb,
+                    token_ref=token_ref,
+                    payload=payload
+                )
+                continue
+            elif e.response.status_code in (500, 502, 503, 504):
+                logger.error(f"Error del servidor ThingsBoard: {e.response.status_code}. Delegando a reintento.")
+                raise
+            else:
+                raise
+        except httpx.RequestError as e:
+            logger.error(f"Error de red: {str(e)}. Delegando a reintento.")
+            raise
+
+        records = []
+        if data:
+            if key in data and isinstance(data[key], list):
+                records = data[key]
+            else:
+                for k, v in data.items():
+                    if k.lower() == key.lower() and isinstance(v, list):
+                        records = v
+                        break
+                if not records and len(data) == 1:
+                    first_val = list(data.values())[0]
+                    if isinstance(first_val, list):
+                        records = first_val
+
+        if not records:
+            logger.info(f"[{device_name}] [REST API] Sin más registros remotos para '{key}' desde ts={current_ts}")
+            break
+
+        # Asegurar orden cronológico ascendente
+        records = sorted(records, key=lambda x: x.get("ts", 0))
+        remote_records.extend(records)
+
+        # Actualizar checkpoint de la tarea con TTL de 24h
+        last_record_ts = records[-1]["ts"]
+        next_ts = max(current_ts + 1, last_record_ts + 1)
+        current_ts = next_ts
+        await local_redis.setex(cache_key, 86400, str(current_ts))
+
+        if len(records) < page_limit:
+            break
+
+    return remote_records
+
+
 async def download_telemetry_for_key(
     tb: ThingsBoardClient,
     task_id: str,
@@ -245,9 +534,17 @@ async def download_telemetry_for_key(
     progress_tracker: dict,
     progress_lock: asyncio.Lock
 ):
+    """
+    Orquestador de descarga para una llave específica:
+    1. Calcula el plan delta (Local Data Lake vs ThingsBoard REST API).
+    2. Ejecuta lecturas locales con ijson (asyncio.to_thread) y descargas REST concurrentemente.
+    3. Trata max_ts en archivos .parcial.json como el nuevo start_date para REST API.
+    4. Consolida resultados unificados en backups/tmp_<TASK_ID>/ usando aiofiles.
+    """
     async with sem:
         page_limit = payload.get("page_limit") or payload.get("config", {}).get("page_limit", 2000)
         entity_type = payload.get("entity_type") or payload.get("ENTITY_TYPE", "DEVICE")
+        base_storage_dir = payload.get("base_storage_dir") or "tenant_backups"
         safe_key = sanitize_name(key)
 
         for interval in intervals:
@@ -258,26 +555,7 @@ async def download_telemetry_for_key(
             state = interval["state"]
 
             force_reload = payload.get("force_reload", False)
-            cache_key = f"tb_backup:{tenant_name}:{entity_id}:{key}:{year_str}_{month_str}:last_ts"
-
-            # Checkpoint: Reanudar desde el último timestamp guardado si es válido y está dentro del rango solicitado
-            if force_reload:
-                current_ts = start_ts
-            else:
-                last_saved_ts = await local_redis.get(cache_key)
-                if last_saved_ts:
-                    try:
-                        parsed_ts = int(last_saved_ts)
-                        if start_ts <= parsed_ts < end_ts:
-                            current_ts = parsed_ts
-                        else:
-                            current_ts = start_ts
-                    except (ValueError, TypeError):
-                        current_ts = start_ts
-                else:
-                    current_ts = start_ts
-
-            month_records = []
+            cache_key = f"tb_checkpoint:{task_id}:{tenant_name}:{entity_id}:{safe_key}:{year_str}_{month_str}"
 
             async with progress_lock:
                 current_pct = progress_tracker["current_pct"]
@@ -295,86 +573,99 @@ async def download_telemetry_for_key(
                 total_records=total_recs
             )
 
-            logger.info(f"[{device_name}] Consultando telemetría para '{key}' en rango [{current_ts} -> {end_ts}] ({month_str}-{year_str})")
-
-            while current_ts < end_ts:
-                try:
-                    data = await tb.get_entity_telemetry(
-                        token=token_ref[0],
-                        entity_type=entity_type,
-                        entity_id=entity_id,
-                        keys=key,
-                        start_ts=current_ts,
-                        end_ts=end_ts,
-                        limit=page_limit
-                    )
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 401:
-                        logger.warning(f"[Telemetry Key] 401 detectado al descargar '{key}'. Ejecutando auto-renovación en vuelo...")
-                        await refresh_tenant_tokens_in_db(
-                            tenant_id=tenant_id,
-                            tb=tb,
-                            token_ref=token_ref,
-                            payload=payload
-                        )
-                        continue
-                    elif e.response.status_code in (500, 502, 503, 504):
-                        logger.error(f"Error del servidor ThingsBoard: {e.response.status_code}. Delegando a Celery Retry.")
-                        raise
-                    else:
-                        raise
-                except httpx.RequestError as e:
-                    logger.error(f"Error de red: {str(e)}. Delegando a Celery Retry.")
-                    raise
-
-                records = []
-                if data:
-                    if key in data and isinstance(data[key], list):
-                        records = data[key]
-                    else:
-                        for k, v in data.items():
-                            if k.lower() == key.lower() and isinstance(v, list):
-                                records = v
-                                break
-                        if not records and len(data) == 1:
-                            first_val = list(data.values())[0]
-                            if isinstance(first_val, list):
-                                records = first_val
-
-                if not records:
-                    logger.info(f"[{device_name}] Sin más registros para '{key}' a partir de ts={current_ts}")
-                    break
-
-                # Asegurar orden cronológico ascendente
-                records = sorted(records, key=lambda x: x.get("ts", 0))
-                month_records.extend(records)
-
-                # Actualizar checkpoint
-                last_record_ts = records[-1]["ts"]
-                next_ts = max(current_ts + 1, last_record_ts + 1)
-                current_ts = next_ts
-                await local_redis.set(cache_key, str(current_ts))
-
-                async with progress_lock:
-                    current_pct = progress_tracker["current_pct"]
-                    total_recs = progress_tracker["total_records"]
-
-                await publish_task_status(
-                    redis_client=local_redis,
-                    user_id=user_id,
-                    task_id=task_id,
-                    status="DOWNLOADING",
+            # 1. Motor de Intersección: Calcular Plan de Extracción Híbrido
+            if force_reload:
+                delta_plan = {
+                    "plan_type": "FULL_REMOTE",
+                    "local_file": None,
+                    "local_start_ts": None,
+                    "local_end_ts": None,
+                    "remote_start_ts": start_ts,
+                    "remote_end_ts": end_ts,
+                    "max_local_ts": None
+                }
+            else:
+                delta_plan = await calculate_telemetry_delta_plan(
                     tenant_name=tenant_name,
-                    current_device=device_name,
-                    current_key=key,
-                    progress_pct=current_pct,
-                    total_records=total_recs
+                    device_name=device_name,
+                    entity_id=entity_id,
+                    key=key,
+                    interval=interval,
+                    base_storage_dir=base_storage_dir
                 )
 
-                if len(records) < page_limit:
-                    break
+            logger.info(
+                f"[{device_name}] ({key}) [{month_str}-{year_str}] Plan Delta: {delta_plan['plan_type']} "
+                f"(Local: {delta_plan['local_start_ts']}..{delta_plan['local_end_ts']}, "
+                f"REST: {delta_plan['remote_start_ts']}..{delta_plan['remote_end_ts']})"
+            )
 
+            month_records: List[dict] = []
+
+            # 2. Ejecución Concurrente del Plan
+            if delta_plan["plan_type"] == "FULL_LOCAL":
+                logger.info(f"[{device_name}] ({key}) 100% de registros leídos desde Data Lake local: {delta_plan['local_file']}")
+                month_records = await read_local_telemetry_stream(
+                    file_path=delta_plan["local_file"],
+                    start_ts=delta_plan["local_start_ts"],
+                    end_ts=delta_plan["local_end_ts"]
+                )
+
+            elif delta_plan["plan_type"] == "FULL_REMOTE":
+                month_records = await fetch_remote_telemetry_range(
+                    tb=tb,
+                    token_ref=token_ref,
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                    key=key,
+                    start_ts=delta_plan["remote_start_ts"],
+                    end_ts=delta_plan["remote_end_ts"],
+                    page_limit=page_limit,
+                    tenant_id=tenant_id,
+                    tenant_name=tenant_name,
+                    device_name=device_name,
+                    payload=payload,
+                    local_redis=local_redis,
+                    cache_key=cache_key,
+                    force_reload=force_reload
+                )
+
+            elif delta_plan["plan_type"] == "HYBRID":
+                logger.info(
+                    f"[{device_name}] ({key}) Ejecutando extracción HÍBRIDA concurrente: "
+                    f"Local [{delta_plan['local_start_ts']} -> {delta_plan['local_end_ts']}] & "
+                    f"REST [{delta_plan['remote_start_ts']} -> {delta_plan['remote_end_ts']}]"
+                )
+                local_task = read_local_telemetry_stream(
+                    file_path=delta_plan["local_file"],
+                    start_ts=delta_plan["local_start_ts"],
+                    end_ts=delta_plan["local_end_ts"]
+                )
+                remote_task = fetch_remote_telemetry_range(
+                    tb=tb,
+                    token_ref=token_ref,
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                    key=key,
+                    start_ts=delta_plan["remote_start_ts"],
+                    end_ts=delta_plan["remote_end_ts"],
+                    page_limit=page_limit,
+                    tenant_id=tenant_id,
+                    tenant_name=tenant_name,
+                    device_name=device_name,
+                    payload=payload,
+                    local_redis=local_redis,
+                    cache_key=cache_key,
+                    force_reload=force_reload
+                )
+
+                local_records, remote_records = await asyncio.gather(local_task, remote_task)
+                month_records = local_records + remote_records
+
+            # 3. Consolidación y Ordenamiento Cronológico
             if month_records:
+                month_records.sort(key=lambda x: x.get("ts", 0))
+
                 dir_path = os.path.join("backups", f"tmp_{task_id}", tenant_name, device_name, year_str, month_str)
                 os.makedirs(dir_path, exist_ok=True)
 
@@ -385,10 +676,7 @@ async def download_telemetry_for_key(
                     ]
                     for old_file in old_candidates:
                         if os.path.exists(old_file):
-                            try:
-                                os.remove(old_file)
-                            except Exception:
-                                pass
+                            await async_remove_file(old_file, ignore_errors=True)
 
                 file_name = f"{entity_id}.{safe_key}.{month_str}-{year_str}.{state}.json"
                 file_path = os.path.join(dir_path, file_name)
@@ -399,10 +687,14 @@ async def download_telemetry_for_key(
                     "length": records_in_file
                 }
 
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(output_content, f, indent=4)
+                json_str = json.dumps(output_content, indent=4, ensure_ascii=False, default=str)
+                async with aiofiles.open(file_path, mode="w", encoding="utf-8") as f:
+                    await f.write(json_str)
 
-                logger.info(f"[{month_str}-{year_str}] - {device_name} ({key}): {records_in_file} registros guardados en {file_name}")
+                logger.info(
+                    f"[{month_str}-{year_str}] - {device_name} ({key}): {records_in_file} registros guardados en {file_name} "
+                    f"(Plan: {delta_plan['plan_type']})"
+                )
 
                 async with progress_lock:
                     progress_tracker["total_records"] += records_in_file
@@ -435,7 +727,8 @@ async def run_download_orchestrator(
     task_id: str,
     tb: ThingsBoardClient,
     user_id: str,
-    payload: dict
+    payload: dict,
+    redis_client: Optional[redis.Redis] = None
 ):
     """
     Orquestador asíncrono principal de descarga masiva de telemetría Multi-Tenant.
@@ -469,7 +762,12 @@ async def run_download_orchestrator(
     end_dt = datetime.fromisoformat(end_date_str).replace(tzinfo=tz)
 
     intervals = get_month_intervals(start_dt, end_dt, now_dt)
-    local_redis = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+    created_local_redis = False
+    if redis_client is not None:
+        local_redis = redis_client
+    else:
+        local_redis = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
+        created_local_redis = True
 
     devices_info = []
 
@@ -669,27 +967,27 @@ async def run_download_orchestrator(
         tenant_dir_in_tmp = os.path.join(tmp_task_dir, tenant_name)
 
         if os.path.exists(tenant_dir_in_tmp):
-            shutil.make_archive(
+            await async_create_zip_archive(
                 base_name=os.path.join("backups", zip_base_name),
-                format="zip",
                 root_dir=tmp_task_dir,
-                base_dir=tenant_name
+                base_dir=tenant_name,
+                format="zip"
             )
             logger.info(f"Empaquetado exitoso: {zip_file_path}")
         elif os.path.exists(tmp_task_dir):
-            shutil.make_archive(
+            await async_create_zip_archive(
                 base_name=os.path.join("backups", zip_base_name),
-                format="zip",
-                root_dir=tmp_task_dir
+                root_dir=tmp_task_dir,
+                format="zip"
             )
             logger.info(f"Empaquetado exitoso: {zip_file_path}")
         else:
             logger.warning(f"No hay datos para empaquetar para el tenant {tenant_name} (tarea {task_id})")
 
-        # Eliminar completamente la carpeta temporal tmp_{task_id} para liberar espacio
+        # Eliminar completamente la carpeta temporal tmp_{task_id} de forma asíncrona para liberar espacio
         if os.path.exists(tmp_task_dir):
             try:
-                shutil.rmtree(tmp_task_dir, ignore_errors=True)
+                await async_rmtree(tmp_task_dir, ignore_errors=True)
                 logger.info(f"Carpeta temporal de trabajo eliminada tras compresión: {tmp_task_dir}")
             except Exception as e:
                 logger.warning(f"No se pudo eliminar la carpeta temporal {tmp_task_dir}: {e}")
@@ -740,6 +1038,20 @@ async def run_download_orchestrator(
         )
 
     except Exception as exc:
+        # Integridad Transaccional: Limpiar de inmediato cualquier directorio temporal huérfano o ZIP corrupto
+        if "tmp_task_dir" in locals() and os.path.exists(tmp_task_dir):
+            try:
+                await async_rmtree(tmp_task_dir, ignore_errors=True)
+                logger.info(f"[Transactional Cleanup] Directorio temporal corrupto '{tmp_task_dir}' purgado tras fallo.")
+            except Exception:
+                pass
+        if "zip_file_path" in locals() and os.path.exists(zip_file_path):
+            try:
+                await async_remove_file(zip_file_path, ignore_errors=True)
+                logger.info(f"[Transactional Cleanup] Archivo ZIP incompleto/corrupto '{zip_file_path}' purgado tras fallo.")
+            except Exception:
+                pass
+
         try:
             total_recs = progress_tracker.get("total_records", 0) if "progress_tracker" in locals() else 0
             await publish_task_status(
@@ -759,4 +1071,5 @@ async def run_download_orchestrator(
         raise exc
 
     finally:
-        await local_redis.aclose()
+        if created_local_redis and local_redis:
+            await local_redis.aclose()

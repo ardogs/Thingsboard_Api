@@ -5,6 +5,7 @@ from core.config import settings
 from core.database import init_db, close_db
 from core.casbin_enforcer import init_casbin_enforcer
 from core.bootstrap import bootstrap_superadmin
+from core.arq_pool import get_arq_pool, close_arq_pool
 from api.endpoints.auth import router as auth_router
 from api.endpoints.users import router as users_router
 from api.endpoints.iam import router as iam_router
@@ -19,20 +20,22 @@ from api.middlewares.audit_log import AuditLogMiddleware
 async def lifespan(app: FastAPI):
     """
     Manejo del ciclo de vida de la aplicación:
-    - Startup: Conectar a MongoDB (Beanie ODM), inicializar AsyncEnforcer de Casbin y ejecutar bootstrapping
-    - Shutdown: Cerrar conexiones
+    - Startup: Conectar a MongoDB (Beanie ODM), inicializar AsyncEnforcer de Casbin, bootstrapping y ARQ pool
+    - Shutdown: Cerrar conexiones ARQ y MongoDB
     """
     await init_db()
     await init_casbin_enforcer()
     await bootstrap_superadmin()
+    app.state.arq_pool = await get_arq_pool()
     yield
+    await close_arq_pool()
     await close_db()
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="2.0.0",
-    description="API Gateway de administración multi-propósito y multi-servidor para ThingsBoard con MongoDB, Beanie ODM y PyCasbin RBAC",
+    version="0.1.0-alfa",
+    description="API Gateway de administración multi-propósito para ThingsBoard",
     lifespan=lifespan
 )
 
