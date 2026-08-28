@@ -96,27 +96,69 @@ class ThingsBoardClient:
     async def test_connection(self) -> dict:
         """
         Prueba la conectividad hacia la instancia ThingsBoard y valida credenciales si están disponibles.
+        Proporciona diagnósticos claros para fallos de DNS, timeouts o errores de autenticación.
         """
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             try:
                 res = await client.get(f"{self.base_url}/api/noauth/activate")
                 is_reachable = res.status_code in (200, 400, 404)
+            except httpx.ConnectError as e:
+                err_str = str(e)
+                if "Name or service not known" in err_str or "getaddrinfo failed" in err_str or "[Errno -2]" in err_str:
+                    clean_msg = f"No se pudo resolver el nombre de host o dominio en '{self.base_url}'. Verifica que la URL no tenga errores tipográficos y que el dominio exista en DNS."
+                else:
+                    clean_msg = f"Fallo al conectar con el servidor '{self.base_url}': {err_str}"
+                return {
+                    "success": False,
+                    "reachable": False,
+                    "authenticated": False,
+                    "base_url": self.base_url,
+                    "error": clean_msg
+                }
+            except httpx.TimeoutException:
+                return {
+                    "success": False,
+                    "reachable": False,
+                    "authenticated": False,
+                    "base_url": self.base_url,
+                    "error": f"Tiempo de espera agotado al conectar a '{self.base_url}'. El servidor ThingsBoard no responde o está bloqueado por firewall."
+                }
             except Exception as e:
-                return {"success": False, "reachable": False, "authenticated": False, "error": str(e)}
+                return {
+                    "success": False,
+                    "reachable": False,
+                    "authenticated": False,
+                    "base_url": self.base_url,
+                    "error": str(e)
+                }
 
             authenticated = False
+            auth_error = None
             if self.token:
                 authenticated = await self.verify_token(self.token)
-            elif self.username and self.password:
-                login_data = await self.login()
-                authenticated = login_data is not None
 
-            return {
-                "success": is_reachable,
+            # Si el token no es válido o expiró, intentar login con credenciales si están presentes
+            if not authenticated and self.username and self.password:
+                try:
+                    login_data = await self.login()
+                    authenticated = login_data is not None
+                    if not authenticated:
+                        auth_error = "Credenciales de usuario o contraseña incorrectas en ThingsBoard"
+                except Exception as auth_exc:
+                    authenticated = False
+                    auth_error = f"Error al autenticar: {auth_exc}"
+            elif not authenticated and self.token:
+                auth_error = "Token JWT expirado o no válido"
+
+            result = {
+                "success": is_reachable and (authenticated or (not self.token and not self.username)),
                 "reachable": is_reachable,
                 "authenticated": authenticated,
                 "base_url": self.base_url
             }
+            if auth_error:
+                result["auth_error"] = auth_error
+            return result
 
     async def get_tenant_devices(self, token: Optional[str] = None, limit: int = 100, page: int = 0) -> dict:
         tok = self._resolve_token(token)

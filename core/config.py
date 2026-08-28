@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     DEBUG: bool = Field(..., description="Flag de modo depuración")
     APP_TIMEZONE: str = Field(default="America/Mexico_City", description="Zona horaria de referencia para la aplicación y expresiones cron")
     BACKUP_DIR: str = Field(default="backups", description="Directorio base para almacenamiento de respaldos ZIP y temporales")
+    MAX_CONCURRENT_ZIP_PACKAGING: int = Field(default=3, description="Límite máximo de empaquetados ZIP concurrentes para no saturar disco/CPU")
+    MAX_CONCURRENT_IO_OPERATIONS: int = Field(default=10, description="Límite máximo de operaciones pesadas concurrentes de I/O en disco")
 
     # --------------------------------------------------------------------------
     # Base de Datos MongoDB

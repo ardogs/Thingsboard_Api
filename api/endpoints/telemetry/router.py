@@ -15,6 +15,7 @@ from core.models.tb_backup import TBBackup
 from core.config import settings
 from core.logger import logger
 from core.redis_client import redis_client
+from core.arq_pool import get_arq_pool
 from core.casbin_enforcer import get_casbin_enforcer
 from api.deps import User, get_current_user
 from workers.tasks import (
@@ -77,7 +78,7 @@ class BackupResponse(BaseModel):
     id: str = Field(..., description="ID del documento de respaldo en MongoDB")
     tenant_id: str = Field(..., description="ID del Tenant respaldado")
     tenant_name: Optional[str] = Field(default=None, description="Nombre del Tenant")
-    task_id: str = Field(..., description="ID de la tarea de Celery")
+    task_id: str = Field(..., description="ID del trabajo/tarea de respaldo en ARQ")
     requested_by: str = Field(..., description="ID del usuario que solicitó el respaldo")
     file_name: str = Field(..., description="Nombre del archivo ZIP generado")
     start_date: datetime = Field(..., description="Fecha de inicio del rango de telemetría")
@@ -166,15 +167,17 @@ async def download_telemetry(
         "user_id": str(current_user.id)
     }
 
-    # 6. Encolar la tarea en Celery de forma completamente asíncrona y no bloqueante
+    # 6. Encolar la tarea en ARQ de forma completamente asíncrona y no bloqueante
     try:
-        task = download_telemetry_task.delay(task_payload)
+        arq_pool = await get_arq_pool()
+        job = await arq_pool.enqueue_job("download_telemetry_task", payload=task_payload)
+        job_id = job.job_id if job else "unknown_job"
     except Exception as e:
         await redis_client.delete(lock_key)
         raise e
 
     return {
-        "task_id": task.id,
+        "task_id": job_id,
         "status": "Task enqueued",
         "user_id": str(current_user.id),
         "tenant_id": str(tenant_doc.id),
@@ -189,22 +192,18 @@ async def get_active_tasks(current_user: User = Depends(get_current_user)):
     """
     Retorna la lista de tareas en ejecución actualmente pertenecientes al usuario autenticado.
     """
-    r = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
-    try:
-        user_registry_key = get_user_registry_key(str(current_user.id))
-        raw_tasks = await r.hgetall(user_registry_key)
-        active_tasks: List[ActiveTaskResponse] = []
+    user_registry_key = get_user_registry_key(str(current_user.id))
+    raw_tasks = await redis_client.hgetall(user_registry_key)
+    active_tasks: List[ActiveTaskResponse] = []
 
-        for task_id, payload_str in raw_tasks.items():
-            try:
-                task_data = json.loads(payload_str)
-                active_tasks.append(ActiveTaskResponse(**task_data))
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"[Active Tasks] Error al parsear estado de tarea {task_id}: {e}")
+    for task_id, payload_str in raw_tasks.items():
+        try:
+            task_data = json.loads(payload_str)
+            active_tasks.append(ActiveTaskResponse(**task_data))
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"[Active Tasks] Error al parsear estado de tarea {task_id}: {e}")
 
-        return active_tasks
-    finally:
-        await r.aclose()
+    return active_tasks
 
 
 @router.get("/stream/{task_id}")
@@ -219,8 +218,7 @@ async def stream_task_progress(
     user_id = str(current_user.id)
 
     async def event_generator():
-        r = redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=True)
-        pubsub = r.pubsub()
+        pubsub = redis_client.pubsub()
         channel = get_user_stream_channel(user_id, task_id)
         registry_key = get_user_registry_key(user_id)
 
@@ -228,7 +226,7 @@ async def stream_task_progress(
             await pubsub.subscribe(channel)
 
             # 1. Enviar estado inicial si está registrado en el Hash del usuario
-            initial_state = await r.hget(registry_key, task_id)
+            initial_state = await redis_client.hget(registry_key, task_id)
             if initial_state:
                 yield f"data: {initial_state}\n\n"
                 try:
@@ -276,7 +274,6 @@ async def stream_task_progress(
             try:
                 await pubsub.unsubscribe(channel)
                 await pubsub.aclose()
-                await r.aclose()
             except Exception as e:
                 logger.warning(f"[SSE] Error cerrando recursos de Redis para task_id {task_id}: {e}")
 
@@ -435,17 +432,32 @@ async def get_task_status(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Consulta el estado de una tarea en Celery para usuarios autenticados.
+    Consulta el estado de un trabajo en ARQ para usuarios autenticados.
     """
-    from workers.tasks import celery_app
-    task_result = celery_app.AsyncResult(task_id)
+    from arq.jobs import Job
+    arq_pool = await get_arq_pool()
+    job = Job(task_id, arq_pool)
+    try:
+        raw_status = await job.status()
+        status_str = raw_status.value if hasattr(raw_status, "value") else str(raw_status)
+    except Exception:
+        status_str = "unknown"
 
     response = {
         "task_id": task_id,
-        "status": task_result.status,
+        "status": status_str,
     }
 
-    if task_result.status == "FAILURE":
-        response["error"] = str(task_result.result)
+    if status_str in ("not_found", "unknown"):
+        # Fallback de verificación en registro de usuario
+        r = redis_client
+        user_registry_key = get_user_registry_key(str(current_user.id))
+        task_json = await r.hget(user_registry_key, task_id)
+        if task_json:
+            try:
+                task_data = json.loads(task_json)
+                response["status"] = task_data.get("status", status_str)
+            except Exception:
+                pass
 
     return response

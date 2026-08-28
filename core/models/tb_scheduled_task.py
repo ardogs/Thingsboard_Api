@@ -1,24 +1,26 @@
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any
-from beanie import Document
+from beanie import Document, Link
 from pydantic import Field, field_validator
 from croniter import croniter
 
 from core.config import settings
+from core.models.tb_tenant import TBTenant
 
 
 class TBScheduledTask(Document):
     """
-    Modelo de Documento Beanie para la programación dinámica de tareas periódicas (Celery Beat).
+    Modelo de Documento Beanie para la programación dinámica de tareas periódicas (ARQ Master Dispatcher).
     Representa el Despachador Maestro donde MongoDB es la única fuente de verdad para los horarios.
     Las expresiones cron se calculan sobre la zona horaria local de la aplicación (settings.APP_TIMEZONE)
     y se persisten estrictamente normalizadas en UTC.
     """
     name: str = Field(..., description="Nombre descriptivo de la tarea programada")
-    task_name: str = Field(..., description="Nombre canónico y registrado de la tarea en Celery")
+    task_name: str = Field(..., description="Nombre canónico y registrado de la tarea en ARQ")
     cron_expression: str = Field(..., description="Expresión cron estándar de 5 campos (ej: '0 8 * * *', '*/5 * * * *')")
-    payload: Dict[str, Any] = Field(default_factory=dict, description="Diccionario de argumentos (kwargs) para la tarea de Celery")
+    tenant_id: Optional[Link[TBTenant]] = Field(default=None, description="Enlace directo al Tenant objetivo para tareas granulares por cliente")
+    payload: Dict[str, Any] = Field(default_factory=dict, description="Diccionario de argumentos adicionales (kwargs) para la tarea de ARQ")
     next_run_time: datetime = Field(..., description="Próxima fecha y hora de ejecución estricta en UTC")
     is_active: bool = Field(default=True, description="Flag booleano que activa o desactiva la ejecución periódica")
     last_run_status: Optional[str] = Field(default=None, description="Estado de la última ejecución (ej: 'DISPATCHED', 'SUCCESS', 'ERROR: ...')")
@@ -38,6 +40,7 @@ class TBScheduledTask(Document):
         name = "tb_scheduled_tasks"
         indexes = [
             [("is_active", 1), ("next_run_time", 1)],
+            [("task_name", 1), ("tenant_id", 1), ("is_active", 1)],
             "name",
             "task_name",
         ]
