@@ -19,6 +19,12 @@ from core.models.tb_tenant import TBTenant
 from core.models.tb_backup import TBBackup
 from core.tb_client import ThingsBoardClient
 from core.logger import logger
+from tenacity import (
+    retry,
+    retry_if_exception,
+    wait_exponential,
+    stop_after_attempt
+)
 from core.io_limiter import (
     async_create_zip_archive,
     async_rmtree,
@@ -418,6 +424,58 @@ async def calculate_telemetry_delta_plan(
     }
 
 
+def is_retryable_http_exception(exc: BaseException) -> bool:
+    """
+    Determina si una excepción es transitoria y susceptible de reintento:
+    - Problemas de conectividad, TLS, sockets y timeouts de HTTPX / httpcore (ConnectError, ReadTimeout, etc.).
+    - Respuestas de error HTTP del servidor o de limitación de tasa (429, 500, 502, 503, 504).
+    """
+    if isinstance(exc, (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.RemoteProtocolError
+    )):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    err_str = (str(type(exc)) + " " + str(exc)).lower()
+    if any(k in err_str for k in ("connecterror", "connection", "timeout", "reset", "closed", "ssl", "protocol", "httpcore", "broken pipe", "network")):
+        return True
+    return False
+
+
+@retry(
+    retry=retry_if_exception(is_retryable_http_exception),
+    wait=wait_exponential(multiplier=1.5, min=2, max=30),
+    stop=stop_after_attempt(10),
+    reraise=True
+)
+async def _safe_fetch_telemetry_page(
+    tb: ThingsBoardClient,
+    token: str,
+    entity_type: str,
+    entity_id: str,
+    keys: str,
+    start_ts: int,
+    end_ts: int,
+    limit: int
+) -> dict:
+    return await tb.get_entity_telemetry(
+        token=token,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        keys=keys,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        limit=limit
+    )
+
+
 async def fetch_remote_telemetry_range(
     tb: ThingsBoardClient,
     token_ref: list,
@@ -437,7 +495,8 @@ async def fetch_remote_telemetry_range(
 ) -> List[dict]:
     """
     Descarga registros de telemetría de ThingsBoard REST API para el sub-rango [start_ts, end_ts].
-    Soporta auto-renovación de tokens en vuelo (HTTP 401), paginación continua y checkpoints en Redis.
+    Soporta auto-renovación de tokens en vuelo (HTTP 401), reintentos con tenacity ante fallos de conexión,
+    paginación continua y checkpoints en Redis.
     """
     current_ts = start_ts
     if not force_reload:
@@ -455,7 +514,8 @@ async def fetch_remote_telemetry_range(
 
     while current_ts < end_ts:
         try:
-            data = await tb.get_entity_telemetry(
+            data = await _safe_fetch_telemetry_page(
+                tb=tb,
                 token=token_ref[0],
                 entity_type=entity_type,
                 entity_id=entity_id,
@@ -474,13 +534,11 @@ async def fetch_remote_telemetry_range(
                     payload=payload
                 )
                 continue
-            elif e.response.status_code in (500, 502, 503, 504):
-                logger.error(f"Error del servidor ThingsBoard: {e.response.status_code}. Delegando a reintento.")
-                raise
             else:
+                logger.error(f"Error HTTP no recuperable ({e.response.status_code}) al consultar '{key}': {e}")
                 raise
-        except httpx.RequestError as e:
-            logger.error(f"Error de red: {str(e)}. Delegando a reintento.")
+        except Exception as e:
+            logger.error(f"Error persistente tras 5 reintentos al consultar '{key}': {e}")
             raise
 
         records = []

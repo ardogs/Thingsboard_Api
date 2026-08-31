@@ -9,6 +9,7 @@ from core.logger import logger
 
 from workers.tasks import (
     download_telemetry_task,
+    generate_excel_report_task,
     master_dispatcher_task,
     cleanup_old_backups_task,
     execute_incremental_tenant_backup_task,
@@ -54,6 +55,8 @@ async def shutdown(ctx: dict):
 REGISTERED_FUNCTIONS = [
     download_telemetry_task,
     func(download_telemetry_task, name="tasks.download_telemetry"),
+    generate_excel_report_task,
+    func(generate_excel_report_task, name="tasks.generate_excel_report"),
     master_dispatcher_task,
     func(master_dispatcher_task, name="tasks.master_dispatcher"),
     cleanup_old_backups_task,
@@ -76,9 +79,10 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
-    max_jobs = 10
+    max_jobs = 1
     job_timeout = 864000  # 10 días (864,000s) para descargas masivas de larga duración
     max_tries = 5
+    allow_abort_jobs = True  # Habilita el aborto de tareas mediante job.abort()
 
 
 class IncrementalWorkerSettings:
@@ -91,6 +95,7 @@ class IncrementalWorkerSettings:
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     queue_name = "incremental_backups"
-    max_jobs = 2
+    max_jobs = 1
     job_timeout = 864000
     max_tries = 5
+    allow_abort_jobs = True  # Habilita el aborto de tareas mediante job.abort()
