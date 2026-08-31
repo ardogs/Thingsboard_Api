@@ -23,7 +23,10 @@ class ThingsBoardClient:
         self.refresh_token = refresh_token
         self.username = username
         self.password = password
-        self.timeout = timeout
+        if isinstance(timeout, (int, float)):
+            self.timeout = httpx.Timeout(timeout=timeout if timeout > 30.0 else 120.0, connect=30.0, read=120.0, write=30.0, pool=30.0)
+        else:
+            self.timeout = timeout
 
     def _resolve_token(self, token: Optional[str] = None) -> str:
         resolved = token or self.token
@@ -182,6 +185,29 @@ class ThingsBoardClient:
                 return response.json()
             return None
 
+    async def create_device(
+        self,
+        device_payload: dict,
+        token: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None
+    ) -> dict:
+        """
+        Crea o actualiza un dispositivo en ThingsBoard mediante POST /api/device.
+        Soporta reutilización de cliente HTTPX para operaciones masivas por lotes.
+        """
+        tok = self._resolve_token(token)
+        headers = {"X-Authorization": f"Bearer {tok}"}
+        url = f"{self.base_url}/api/device"
+        if client is not None:
+            response = await client.post(url, headers=headers, json=device_payload)
+            response.raise_for_status()
+            return response.json()
+        else:
+            async with httpx.AsyncClient(timeout=self.timeout) as ac:
+                response = await ac.post(url, headers=headers, json=device_payload)
+                response.raise_for_status()
+                return response.json()
+
     async def get_entity_timeseries_keys(self, entity_id: str, entity_type: str = "DEVICE", token: Optional[str] = None) -> list[str]:
         tok = self._resolve_token(token)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -217,3 +243,66 @@ class ThingsBoardClient:
             )
             response.raise_for_status()
             return response.json()
+
+    async def find_entities_by_query(
+        self,
+        query: dict,
+        token: Optional[str] = None
+    ) -> dict:
+        """
+        Ejecuta una consulta avanzada contra el motor de Entity Query de ThingsBoard (/api/entitiesQuery/find).
+        Permite recuperar entidades y relaciones en una sola llamada de red sin N+1.
+        """
+        tok = self._resolve_token(token)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/api/entitiesQuery/find",
+                headers={"X-Authorization": f"Bearer {tok}"},
+                json=query
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def get_tenant_assets(
+        self,
+        token: Optional[str] = None,
+        limit: int = 100,
+        page: int = 0
+    ) -> dict:
+        """
+        Obtiene los activos (Assets/Sitios) registrados para el tenant en ThingsBoard (/api/tenant/assets).
+        """
+        tok = self._resolve_token(token)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                f"{self.base_url}/api/tenant/assets",
+                headers={"X-Authorization": f"Bearer {tok}"},
+                params={"pageSize": limit, "page": page}
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def get_entity_relations(
+        self,
+        from_id: str,
+        from_type: str = "ASSET",
+        token: Optional[str] = None
+    ) -> list[dict]:
+        """
+        Obtiene las relaciones salientes de una entidad en ThingsBoard (/api/relations/info).
+        """
+        tok = self._resolve_token(token)
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                response = await client.get(
+                    f"{self.base_url}/api/relations/info",
+                    headers={"X-Authorization": f"Bearer {tok}"},
+                    params={"fromId": from_id, "fromType": from_type}
+                )
+                if response.status_code == 200:
+                    return response.json()
+                return []
+            except Exception:
+                return []
+
+

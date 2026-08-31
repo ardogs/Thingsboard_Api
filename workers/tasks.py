@@ -26,6 +26,7 @@ from core.services.telemetry_service import (
     get_user_stream_channel,
     get_user_registry_key
 )
+from core.services.excel_report_service import run_excel_report_orchestrator
 from core.services.incremental_backup_service import (
     calculate_previous_month_boundaries,
     run_incremental_tenant_backup
@@ -153,6 +154,26 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
             payload=payload,
             redis_client=redis_conn
         )
+    except asyncio.CancelledError:
+        logger.warning(f"[ARQ Router] Tarea {job_id} CANCELADA / ABORTADA por señal externa.")
+        # Purgar carpeta temporal residual tmp_<job_id>
+        tmp_dir = os.path.join("backups", f"tmp_{job_id}")
+        if os.path.exists(tmp_dir):
+            try:
+                await async_rmtree(tmp_dir, ignore_errors=True)
+                logger.info(f"[ARQ Router] Carpeta temporal residual '{tmp_dir}' purgada exitosamente tras cancelación.")
+            except Exception as clean_err:
+                logger.warning(f"[ARQ Router] Error purgando carpeta temporal '{tmp_dir}': {clean_err}")
+
+        await publish_task_status(
+            redis_client=redis_conn,
+            user_id=user_id,
+            task_id=job_id,
+            status="CANCELLED",
+            tenant_name=tenant_name,
+            cleanup_on_terminal=True
+        )
+        raise
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
         if job_try <= 5:
             countdown = 2 ** min(job_try, 5)
@@ -196,7 +217,7 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
         )
         raise exc
     finally:
-        # 6. Limpieza Garantizada: Cancelar Heartbeat y liberar el Lock en Redis
+        # 6. Limpieza Garantizada: Cancelar Heartbeat, liberar el Lock en Redis y asegurar purga de temporales
         logger.info(f"[ARQ Worker] Finalizando tarea {job_id}. Cancelando Heartbeat y liberando lock '{lock_key}'...")
         heartbeat_task.cancel()
         try:
@@ -211,6 +232,183 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
             logger.info(f"[ARQ Worker] Candado distribuido '{lock_key}' eliminado exitosamente de Redis.")
         except Exception as e:
             logger.error(f"[ARQ Worker] Error al eliminar candado '{lock_key}' en Redis: {e}")
+
+        # Limpieza defensiva de carpeta temporal si quedó residual
+        tmp_dir = os.path.join("backups", f"tmp_{job_id}")
+        if os.path.exists(tmp_dir):
+            try:
+                await async_rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+async def generate_excel_report_task(ctx: dict, payload: Optional[dict] = None, **kwargs) -> dict:
+    """
+    Enrutador ARQ asíncrono para tareas de exportación de telemetría a Excel (.xlsx).
+    Resuelve el tenant y servidor en MongoDB, recupera report_config,
+    adquiere/renueva el distributed lock con heartbeat y delega la ejecución a excel_report_service.
+    """
+    actual_payload = payload if payload is not None else kwargs
+    job_id = ctx.get("job_id") or actual_payload.get("task_id") or str(uuid.uuid4())
+    job_try = ctx.get("job_try", 1)
+    tenant_id = actual_payload.get("tenant_id", "unknown_tenant")
+    tenant_name = actual_payload.get("tenant_name", "default")
+    user_id = str(actual_payload.get("user_id") or "default_user")
+
+    logger.info(f"[ARQ Router] Enrutando tarea de reporte Excel {job_id} (Tenant: {tenant_name}, ID: {tenant_id}, Intento: {job_try})")
+
+    # 1. Resolver Tenant en MongoDB
+    try:
+        obj_id = PydanticObjectId(tenant_id)
+        tenant = await TBTenant.get(obj_id)
+    except Exception:
+        tenant = await TBTenant.get(tenant_id)
+
+    if not tenant:
+        raise ValueError(f"No se encontró el Tenant de ThingsBoard con ID: {tenant_id}")
+
+    server = await tenant.get_server()
+    if not server:
+        raise ValueError(f"No se encontró el servidor ThingsBoard asociado al Tenant '{tenant.name}'")
+
+    server_id = str(server.id)
+    logger.info(f"[ARQ Router] Tenant resuelto: '{tenant.name}' en Servidor: '{server.name}' (ID: {server_id})")
+
+    # 2. Instanciar ThingsBoardClient
+    plain_token = tenant.get_token()
+    plain_refresh_token = tenant.get_refresh_token()
+    plain_password = tenant.get_password()
+
+    tb_client = ThingsBoardClient(
+        base_url=server.base_url,
+        token=plain_token,
+        refresh_token=plain_refresh_token,
+        username=tenant.username,
+        password=plain_password
+    )
+
+    # 3. Arranque en frío si no hay token inicial
+    if not plain_token or not str(plain_token).strip():
+        if not tenant.username or not plain_password:
+            raise ValueError(
+                f"El Tenant '{tenant.name}' no tiene tokens iniciales ni credenciales para arranque en frío."
+            )
+        logger.info(f"[ARQ Worker] Arranque en frío detectado para Tenant '{tenant.name}'. Ejecutando login inicial...")
+        login_res = await tb_client.login(tenant.username, plain_password)
+        if not login_res or "token" not in login_res:
+            raise ValueError(f"Fallo de autenticación en arranque en frío para Tenant '{tenant.name}'.")
+
+        tenant.set_tokens(login_res["token"], login_res.get("refreshToken"))
+        tenant.updated_at = datetime.now(timezone.utc)
+        await tenant.save()
+
+    # Inyectar report_config del documento si no viene en payload
+    if "report_config" not in actual_payload or not actual_payload["report_config"]:
+        actual_payload["report_config"] = tenant.custom_metadata.get("report_config", {}) if tenant.custom_metadata else {}
+
+    actual_payload["tenant_name"] = tenant.name
+    actual_payload["server_url"] = server.base_url
+    actual_payload["server_id"] = server_id
+
+    # 4. Candado distribuido y Heartbeat
+    lock_key = get_server_lock_key(server_id)
+    redis_conn = ctx.get("redis") or get_redis_client()
+
+    await redis_conn.expire(lock_key, 3600)
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_server_lock(redis_conn=redis_conn, lock_key=lock_key, interval_seconds=1800, ttl_seconds=3600)
+    )
+
+    try:
+        return await run_excel_report_orchestrator(
+            task_id=job_id,
+            tb=tb_client,
+            user_id=user_id,
+            payload=actual_payload,
+            redis_client=redis_conn
+        )
+    except asyncio.CancelledError:
+        logger.warning(f"[ARQ Router] Tarea Excel {job_id} CANCELADA / ABORTADA por señal externa.")
+        tmp_dir = os.path.join("backups", f"tmp_{job_id}")
+        if os.path.exists(tmp_dir):
+            try:
+                await async_rmtree(tmp_dir, ignore_errors=True)
+                logger.info(f"[ARQ Router] Carpeta temporal residual '{tmp_dir}' purgada exitosamente tras cancelación.")
+            except Exception as clean_err:
+                logger.warning(f"[ARQ Router] Error purgando carpeta temporal '{tmp_dir}': {clean_err}")
+
+        await publish_task_status(
+            redis_client=redis_conn,
+            user_id=user_id,
+            task_id=job_id,
+            status="CANCELLED",
+            tenant_name=tenant_name,
+            cleanup_on_terminal=True
+        )
+        raise
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        if job_try <= 5:
+            countdown = 2 ** min(job_try, 5)
+            logger.error(f"[ARQ Router] Fallo de conectividad en tarea Excel {job_id}: {exc}. Reintentando en {countdown}s...")
+            raise Retry(defer=countdown)
+        else:
+            await publish_task_status(
+                redis_client=redis_conn,
+                user_id=user_id,
+                task_id=job_id,
+                status="ERROR",
+                tenant_name=tenant_name,
+                cleanup_on_terminal=True
+            )
+            raise exc
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (500, 502, 503, 504) and job_try <= 5:
+            countdown = 2 ** min(job_try, 5)
+            logger.error(f"[ARQ Router] Error de servidor ({exc.response.status_code}) en tarea Excel {job_id}. Reintentando en {countdown}s...")
+            raise Retry(defer=countdown)
+        else:
+            await publish_task_status(
+                redis_client=redis_conn,
+                user_id=user_id,
+                task_id=job_id,
+                status="ERROR",
+                tenant_name=tenant_name,
+                cleanup_on_terminal=True
+            )
+            raise exc
+    except Exception as exc:
+        logger.error(f"[ARQ Router] Error no recuperable en tarea Excel {job_id}: {exc}")
+        await publish_task_status(
+            redis_client=redis_conn,
+            user_id=user_id,
+            task_id=job_id,
+            status="ERROR",
+            tenant_name=tenant_name,
+            cleanup_on_terminal=True
+        )
+        raise exc
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+        try:
+            await redis_conn.delete(lock_key)
+            logger.info(f"[ARQ Worker] Candado distribuido '{lock_key}' eliminado exitosamente de Redis.")
+        except Exception as e:
+            logger.error(f"[ARQ Worker] Error al eliminar candado '{lock_key}' en Redis: {e}")
+
+        # Limpieza defensiva de carpeta temporal si quedó residual
+        tmp_dir = os.path.join("backups", f"tmp_{job_id}")
+        if os.path.exists(tmp_dir):
+            try:
+                await async_rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 async def master_dispatcher_task(ctx: dict) -> None:
@@ -489,6 +687,9 @@ async def execute_incremental_tenant_backup_task(
 
     try:
         return await run_incremental_tenant_backup(actual_payload)
+    except asyncio.CancelledError:
+        logger.warning(f"[ARQ Worker] Tarea incremental {job_id} CANCELADA / ABORTADA por señal externa.")
+        raise
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
         if job_try <= 5:
             countdown = 2 ** min(job_try, 5)
