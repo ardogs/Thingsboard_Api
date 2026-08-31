@@ -29,7 +29,9 @@ lazy-model==0.3.0
 mongomock==4.3.0
 mongomock-motor==0.0.36
 motor==3.7.1
+openpyxl==3.1.5
 packaging==26.3
+pandas==3.0.5
 passlib==1.7.4
 prompt_toolkit==3.0.53
 pyasn1==0.6.4

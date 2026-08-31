@@ -91,6 +91,19 @@ class TenantUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
 
 
+class ReportConfigRequest(BaseModel):
+    report_config: Dict[str, List[str]] = Field(
+        ...,
+        description="Configuración de whitelist de telemetría por dispositivo o default",
+        json_schema_extra={
+            "example": {
+                "default": ["temperature", "humidity"],
+                "S1_TH_019": ["temperature"]
+            }
+        }
+    )
+
+
 class TenantResponse(BaseModel):
     id: str
     server_id: str
@@ -425,6 +438,32 @@ async def update_server_tenant(
     if "is_active" in update_data and update_data["is_active"] is not None:
         tenant.is_active = update_data["is_active"]
 
+    tenant.updated_at = datetime.now(timezone.utc)
+    await tenant.save()
+    return _to_tenant_response(tenant)
+
+
+@router.put("/{server_id}/tenants/{tenant_id}/report-config", response_model=TenantResponse)
+async def update_tenant_report_config(
+    server_id: str,
+    tenant_id: str,
+    request: ReportConfigRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Actualiza específicamente el diccionario report_config dentro del campo custom_metadata
+    del documento TBTenant para definir las listas blancas de telemetría a exportar.
+    """
+    await _resolve_server(server_id, current_user)
+    tenant = await _resolve_tenant(tenant_id, current_user)
+
+    if _get_server_ref_id(tenant) != server_id:
+        raise HTTPException(status_code=400, detail="El tenant no pertenece al servidor especificado")
+
+    if tenant.custom_metadata is None:
+        tenant.custom_metadata = {}
+
+    tenant.custom_metadata["report_config"] = request.report_config
     tenant.updated_at = datetime.now(timezone.utc)
     await tenant.save()
     return _to_tenant_response(tenant)

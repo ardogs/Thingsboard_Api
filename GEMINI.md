@@ -22,6 +22,7 @@
 15. **Data Lake de Respaldos Incrementales de Mes Vencido (`tasks.schedule_monthly_incremental_backups` y `tasks.execute_incremental_tenant_backup`):** Orquestación mensual secuencial por Tenant hacia la cola `incremental_backups` en ARQ, cálculo estricto de fronteras temporales en milisegundos con `ZoneInfo(settings.APP_TIMEZONE)`, concurrencia interna de hasta 4 llaves con `asyncio.Semaphore`, resiliencia extrema con `tenacity` (reintentos ante 429, 500, 502, 503, 504, ReadTimeout y auto-renovación en 401), streaming de JSON sin sobreescritura a `.parcial.json` e idempotencia con `.completo.json` en `tenant_backups/<TENANT>/<DEVICE>/<AÑO>/<MES>/`.
 16. **Blindaje de E/S Asíncrona, Aislamiento con `asyncio.to_thread()` y Semáforo Global de I/O (`core/io_limiter.py`):** Escritura no bloqueante de fragmentos JSON en streaming con `aiofiles`, delegación de compresión pesada (`shutil.make_archive`) y purga de directorios (`shutil.rmtree`) a hilos secundarios vía `asyncio.to_thread()`, semáforo global `get_zip_semaphore()` para limitar empaquetados simultáneos (máximo 3) y manejo transaccional defensivo con purga inmediata ante fallos de disco (`OSError`, `IOError`).
 17. **Motor de Extracción Híbrido de Telemetría (Local Data Lake + REST API con `ijson` y Delta Calculator):** Comparación dinámica de rangos temporales contra archivos locales en `tenant_backups/<TENANT>/<DEVICE>/<AÑO>/<MES>/`, lectura no bloqueante en streaming con `ijson` delegada a `asyncio.to_thread()` (consumo de RAM $O(1)$), tratamiento de `max_ts` en archivos `.parcial.json` como punto de corte para consultas REST a ThingsBoard (`max_ts + 1`) y consolidación asíncrona concurrente con `aiofiles` en `backups/tmp_<TASK_ID>/` antes del empaquetado ZIP.
+18. **Módulo de Exportación de Telemetría a Excel (`.xlsx`), Whitelist y Control de Memoria (`core/services/excel_report_service.py`):** Persistencia de listas blancas por tenant/dispositivo en `custom_metadata.report_config` (`PUT /api/v1/servers/{server_id}/tenants/{tenant_id}/report-config`), DTO `ExcelReportRequest` con validación mutuamente exclusiva de fechas exactas o año/mes dinámico (`calendar.monthrange`), resolución de Sitios y Dispositivos sin N+1 mediante Entity Query (`/api/entitiesQuery/find`), tarea ARQ `generate_excel_report_task` con filtrado estricto antes de construir DataFrames de Pandas, y gestión agresiva de memoria e I/O no bloqueante con `asyncio.to_thread()` (`combine_in_single_file == True` genera un `.xlsx` multi-hoja; `False` genera múltiples `.xlsx` con `gc.collect()` tras cada archivo, empaquetado en `.zip` y purga de residuales).
 
 ---
 
@@ -40,7 +41,7 @@ flowchart TD
         IAMRouter["/api/v1/iam\n(Roles por Tenant / Políticas Casbin)"]
         ServerRouter["/api/v1/servers\n(CRUD TBServer, CRUD TBTenant & Test-Connection)"]
         TelemRouter["/api/v1/telemetry\n(Download con tenant_id / Active / Stream SSE / ZIP)"]
-        DeviceRouter["/api/v1/devices\n(List Devices / Batch Provisioning por Tenant)"]
+        DeviceRouter["/api/v1/tenants/{tenant_id}/devices\n(List Devices / Batch Provisioning por Tenant)"]
         SchedulerRouter["/api/v1/scheduler/tasks\n(CRUD TBScheduledTask / Trigger Manual a ARQ)"]
     end
 
@@ -154,7 +155,7 @@ Thingsboard_Api/
 │       ├── telemetry/                 # Dominio de Telemetría y Respaldos (/api/v1/telemetry)
 │       │   ├── __init__.py
 │       │   └── router.py              # Encolado en ARQ, tareas activas, SSE y descarga de ZIP
-│       ├── devices/                   # Dominio de Dispositivos y Aprovisionamiento (/api/v1/devices)
+│       ├── devices/                   # Dominio de Dispositivos y Aprovisionamiento (/api/v1/tenants/{tenant_id}/devices)
 │       │   ├── __init__.py
 │       │   └── router.py              # Listado y aprovisionamiento masivo por Tenant
 │       └── scheduler/                 # Dominio de Automatizaciones y Tareas Programadas (/api/v1/scheduler/tasks)
@@ -557,22 +558,40 @@ backups/
 #### 6. Consultar Estado de Tarea en ARQ
 - **Método:** `GET` | **Ruta:** `/api/v1/telemetry/status/{task_id}`
 
----
-
-### 6.6. Dominio de Dispositivos (`/api/v1/devices`)
-
-#### 1. Listar Dispositivos de un Servidor / Tenant
-- **Método:** `GET` | **Ruta:** `/api/v1/devices/{server_id}?tenant_id={tenant_id}&limit=100&page=0`
-
-#### 2. Consultar Detalle de Dispositivo
-- **Método:** `GET` | **Ruta:** `/api/v1/devices/{server_id}/{device_id}?tenant_id={tenant_id}`
-
-#### 3. Plantilla de Aprovisionamiento Masivo por Tenant
-- **Método:** `POST` | **Ruta:** `/api/v1/devices/{server_id}/provision`
-- **Cuerpo:**
+#### 7. Botón de Pánico: Cancelar Tarea ARQ en Ejecución
+- **Método:** `POST` | **Ruta:** `/api/v1/telemetry/tasks/{job_id}/cancel`
+- **Mecanismo:** Emite señal `job.abort()` a ARQ (habilitado por `allow_abort_jobs = True`), publica evento `CANCELLED` en SSE, purga directorios temporales residuales `tmp_{job_id}` y libera candados distribuidos en Redis.
+- **Respuesta:**
 ```json
 {
-  "tenant_id": "6a896a562dbf2d144808b5b6",
+  "status": "cancelled",
+  "job_id": "job_running_123",
+  "aborted": true,
+  "previous_status": "in_progress",
+  "message": "Señal de terminación enviada exitosamente para la tarea 'job_running_123'."
+}
+```
+
+---
+
+### 6.6. Dominio de Dispositivos (`/api/v1/tenants/{tenant_id}/devices`)
+
+#### 1. Listar Dispositivos de un Tenant
+- **Método:** `GET` | **Ruta:** `/api/v1/tenants/{tenant_id}/devices?limit=100&page=0`
+- **Resolución:** Inversa (`TBTenant` $\to$ `TBServer`) con descifrado de credenciales JWT en memoria RAM.
+
+#### 2. Consultar Sitios y Dispositivos Asociados (Entity Query sin N+1)
+- **Método:** `GET` | **Ruta:** `/api/v1/tenants/{tenant_id}/devices/sites`
+- **Mecanismo:** Consulta `/api/entitiesQuery/find` en una sola llamada de red, resolviendo Assets (Sitios) y sus Devices relacionados.
+
+#### 3. Consultar Detalle de Dispositivo
+- **Método:** `GET` | **Ruta:** `/api/v1/tenants/{tenant_id}/devices/{device_id}`
+
+#### 4. Aprovisionamiento Masivo Real por Tenant (Zero-Trust & Resiliencia por Lote)
+- **Método:** `POST` | **Ruta:** `/api/v1/tenants/{tenant_id}/devices/provision`
+- **Cuerpo (sin parámetro `tenant_id` en payload):**
+```json
+{
   "devices": [
     {
       "name": "Medidor_Energia_01",
@@ -580,7 +599,31 @@ backups/
       "label": "Planta Norte",
       "additional_info": {"model": "EM-3000"}
     }
-  ]
+  ],
+  "device_profile_id": "optional_profile_uuid"
+}
+```
+- **Respuesta de Resumen:**
+```json
+{
+  "status": "success",
+  "tenant_id": "6a896a562dbf2d144808b5b6",
+  "tenant_name": "Tenant_CFE",
+  "server_id": "6a896a562dbf2d144808b5b5",
+  "server_name": "TB_Production",
+  "total_received": 1,
+  "successfully_created": 1,
+  "failed": 0,
+  "created_devices": [
+    {
+      "id": "dev-uuid-1234",
+      "name": "Medidor_Energia_01",
+      "type": "energy_meter",
+      "label": "Planta Norte"
+    }
+  ],
+  "errors": [],
+  "message": "Se aprovisionaron exitosamente todos los 1 dispositivos."
 }
 ```
 

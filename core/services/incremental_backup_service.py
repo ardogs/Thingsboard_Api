@@ -80,17 +80,29 @@ def is_retryable_http_exception(exc: BaseException) -> bool:
     - Problemas de conectividad y timeouts de HTTPX.
     - Respuestas de error HTTP del servidor o de limitación de tasa (429, 500, 502, 503, 504).
     """
-    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout)):
+    if isinstance(exc, (
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.RemoteProtocolError
+    )):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (429, 500, 502, 503, 504)
+    err_str = (str(type(exc)) + " " + str(exc)).lower()
+    if any(k in err_str for k in ("connecterror", "connection", "timeout", "reset", "closed", "ssl", "protocol", "httpcore", "broken pipe", "network")):
+        return True
     return False
 
 
 @retry(
     retry=retry_if_exception(is_retryable_http_exception),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1.5, min=2, max=30),
+    stop=stop_after_attempt(10),
     reraise=True
 )
 async def fetch_telemetry_page_with_retry(

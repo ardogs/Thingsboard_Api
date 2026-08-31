@@ -48,7 +48,7 @@ app.include_router(users_router, prefix="/api/v1/users", tags=["Gestión de Usua
 app.include_router(iam_router, prefix="/api/v1/iam", tags=["IAM y Políticas Casbin"])
 app.include_router(servers_router, prefix="/api/v1/servers", tags=["Servidores ThingsBoard"])
 app.include_router(telemetry_router, prefix="/api/v1/telemetry", tags=["Telemetría"])
-app.include_router(devices_router, prefix="/api/v1/devices", tags=["Dispositivos y Aprovisionamiento"])
+app.include_router(devices_router, prefix="/api/v1/tenants", tags=["Dispositivos y Aprovisionamiento"])
 app.include_router(scheduler_router, prefix="/api/v1/scheduler/tasks", tags=["Scheduler y Tareas Programadas"])
 
 # Compatibilidad con rutas v0 / legacy
