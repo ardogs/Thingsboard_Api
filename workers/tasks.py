@@ -705,3 +705,44 @@ async def execute_incremental_tenant_backup_task(
     except Exception as exc:
         logger.error(f"[ARQ Worker] Error fatal en tarea incremental {job_id}: {exc}", exc_info=True)
         raise exc
+
+
+async def collect_servers_system_info_task(
+    ctx: dict,
+    payload: Optional[dict] = None,
+    **kwargs
+) -> dict:
+    """
+    Tarea asíncrona de ARQ para recolectar información del uso de CPU, RAM y Disco
+    mediante GET /api/admin/systemInfo de cada servidor registrado (o servidor específico).
+    Soporta programación periódica mediante TBScheduledTask o disparo manual bajo demanda.
+    """
+    actual_payload = payload if payload is not None else kwargs
+    job_id = ctx.get("job_id") or "sysinfo_" + str(uuid.uuid4())
+    job_try = ctx.get("job_try", 1)
+    server_id = actual_payload.get("server_id") if actual_payload else None
+
+    logger.info(f"[ARQ Worker] Ejecutando collect_servers_system_info_task {job_id} (server_id={server_id}, Intento: {job_try})")
+
+    try:
+        from core.services.system_info_service import collect_all_servers_system_info
+        return await collect_all_servers_system_info(server_id=server_id)
+    except asyncio.CancelledError:
+        logger.warning(f"[ARQ Worker] Tarea systemInfo {job_id} CANCELADA por señal externa.")
+        raise
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        if job_try <= 5:
+            countdown = 2 ** min(job_try, 5)
+            logger.error(f"[ARQ Worker] Fallo transitorio de red en tarea systemInfo {job_id}: {exc}. Reintentando en {countdown}s...")
+            raise Retry(defer=countdown)
+        raise exc
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (429, 500, 502, 503, 504) and job_try <= 5:
+            countdown = 2 ** min(job_try, 5)
+            logger.error(f"[ARQ Worker] Error HTTP transitorio ({exc.response.status_code}) en tarea systemInfo {job_id}. Reintentando en {countdown}s...")
+            raise Retry(defer=countdown)
+        raise exc
+    except Exception as exc:
+        logger.error(f"[ARQ Worker] Error no recuperable en tarea systemInfo {job_id}: {exc}", exc_info=True)
+        raise exc
+

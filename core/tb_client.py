@@ -305,4 +305,20 @@ class ThingsBoardClient:
             except Exception:
                 return []
 
+    async def get_system_info(self, token: Optional[str] = None) -> dict:
+        """
+        Obtiene la información del sistema (CPU, RAM, Disco, JVM, etc.) mediante GET /api/admin/systemInfo.
+        Requiere privilegios de Sysadmin en ThingsBoard.
+        """
+        tok = self._resolve_token(token)
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.get(
+                f"{self.base_url}/api/admin/systemInfo",
+                headers={"X-Authorization": f"Bearer {tok}"}
+            )
+            response.raise_for_status()
+            return response.json()
+
+
+
 

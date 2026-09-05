@@ -1,6 +1,6 @@
 import base64
 import hashlib
-from typing import Optional
+from typing import Optional, Union
 from cryptography.fernet import Fernet
 from core.config import settings
 from core.logger import logger
@@ -25,14 +25,16 @@ def _get_fernet_instance(raw_key: str) -> Fernet:
 _fernet: Fernet = _get_fernet_instance(settings.ENCRYPTION_KEY)
 
 
-def encrypt_data(plain_text: Optional[str]) -> Optional[str]:
+def encrypt_data(plain_text: Optional[Union[str, bytes]]) -> Optional[str]:
     """
-    Cifra una cadena de texto plano utilizando Fernet (cifrado simétrico autenticado AES-128-CBC + HMAC-SHA256).
+    Cifra una cadena de texto plano o bytes utilizando Fernet (cifrado simétrico autenticado AES-128-CBC + HMAC-SHA256).
     Retorna el texto cifrado codificado en base64 url-safe o None si la entrada es None.
     """
     if plain_text is None:
         return None
-    if not isinstance(plain_text, str):
+    if isinstance(plain_text, bytes):
+        plain_text = plain_text.decode("utf-8")
+    elif not isinstance(plain_text, str):
         plain_text = str(plain_text)
     if plain_text == "":
         return ""
@@ -44,14 +46,16 @@ def encrypt_data(plain_text: Optional[str]) -> Optional[str]:
         raise ValueError(f"Fallo en el cifrado simétrico: {e}") from e
 
 
-def decrypt_data(cipher_text: Optional[str]) -> Optional[str]:
+def decrypt_data(cipher_text: Optional[Union[str, bytes]]) -> Optional[str]:
     """
-    Descifra una cadena de texto cifrada con Fernet y retorna el texto plano en memoria RAM.
+    Descifra una cadena de texto o bytes cifrada con Fernet y retorna el texto plano en memoria RAM.
     Retorna None si cipher_text es None.
     """
     if cipher_text is None:
         return None
-    if not isinstance(cipher_text, str):
+    if isinstance(cipher_text, bytes):
+        cipher_text = cipher_text.decode("utf-8")
+    elif not isinstance(cipher_text, str):
         cipher_text = str(cipher_text)
     if cipher_text == "":
         return ""
@@ -61,3 +65,4 @@ def decrypt_data(cipher_text: Optional[str]) -> Optional[str]:
     except Exception as e:
         logger.error(f"[Crypto] Error al descifrar datos sensibles: {e}")
         raise ValueError(f"Fallo en el descifrado simétrico: {e}") from e
+

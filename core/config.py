@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     BACKUP_DIR: str = Field(default="backups", description="Directorio base para almacenamiento de respaldos ZIP y temporales")
     MAX_CONCURRENT_ZIP_PACKAGING: int = Field(default=3, description="Límite máximo de empaquetados ZIP concurrentes para no saturar disco/CPU")
     MAX_CONCURRENT_IO_OPERATIONS: int = Field(default=10, description="Límite máximo de operaciones pesadas concurrentes de I/O en disco")
+    CORS_ORIGINS: list[str] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"], description="Lista de orígenes permitidos por CORS")
 
     # --------------------------------------------------------------------------
     # Base de Datos MongoDB
@@ -36,6 +37,7 @@ class Settings(BaseSettings):
     ALGORITHM: str = Field(..., description="Algoritmo de firma para tokens JWT (ej: HS256)")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(..., description="Tiempo de expiración del access token en minutos")
     ENCRYPTION_KEY: str = Field(..., description="Clave de cifrado para datos sensibles en reposo")
+    COOKIE_SECURE: bool = Field(default=False, description="Flag Secure para cookies HttpOnly (HTTPS)")
 
     # --------------------------------------------------------------------------
     # Bootstrapping y Superadministrador Inicial

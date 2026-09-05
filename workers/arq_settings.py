@@ -13,6 +13,7 @@ from workers.tasks import (
     master_dispatcher_task,
     cleanup_old_backups_task,
     execute_incremental_tenant_backup_task,
+    collect_servers_system_info_task,
 )
 
 
@@ -63,7 +64,10 @@ REGISTERED_FUNCTIONS = [
     func(cleanup_old_backups_task, name="tasks.cleanup_old_backups"),
     execute_incremental_tenant_backup_task,
     func(execute_incremental_tenant_backup_task, name="tasks.execute_incremental_tenant_backup"),
+    collect_servers_system_info_task,
+    func(collect_servers_system_info_task, name="tasks.collect_servers_system_info"),
 ]
+
 
 
 class WorkerSettings:

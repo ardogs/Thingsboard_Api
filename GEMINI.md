@@ -5,16 +5,16 @@
 **ThingsBoard Super API** es una plataforma backend de **API Gateway, Orquestador Multi-Servidor & Multi-Tenant e IAM Centralizado** construida con **FastAPI**, **MongoDB (Beanie ODM)**, **ARQ (Async Redis Queue)**, **Redis** y **PyCasbin**. Está diseñada para administrar, orquestar y ejecutar operaciones masivas (descarga histórica de telemetría, aprovisionamiento de dispositivos, ejecución de scripts y control de acceso granular) sobre múltiples servidores independientes de **ThingsBoard** y múltiples **Tenants** por servidor de forma 100% asíncrona nativa.
 
 ### 🎯 Capacidades Principales
-1. **API Gateway Multi-Servidor & Multi-Tenant:** Registro de infraestructura (`TBServer`) y Tenants independientes (`TBTenant`) en MongoDB con credenciales de Tenant Admin, tokens JWT y metadatos flexibles específicos.
-2. **Cifrado Simétrico en Reposo con Fernet (`core/crypto.py`):** Cifrado simétrico a nivel de aplicación (`cryptography.fernet`) para contraseñas y tokens JWT de ThingsBoard en MongoDB. Cero credenciales en texto plano en la base de datos y descifrado seguro exclusivo en memoria RAM para clientes HTTP.
+1. **API Gateway Multi-Servidor & Multi-Tenant:** Registro de infraestructura (`TBServer`) y Tenants independientes (`TBTenant`) en MongoDB con credenciales de Sysadmin y Tenant Admin, tokens JWT cifrados y metadatos flexibles específicos.
+2. **Cifrado Simétrico en Reposo con Fernet (`core/crypto.py`):** Cifrado simétrico a nivel de aplicación (`cryptography.fernet`) para contraseñas y tokens JWT de Sysadmin (`TBServer`) y Tenant Admin (`TBTenant`) en MongoDB. Cero credenciales en texto plano en la base de datos y descifrado seguro exclusivo en memoria RAM para clientes HTTP.
 3. **Pureza Asíncrona del Event Loop (ARQ & Redis Nativo):** Procesamiento de fondo 100% asíncrono con **ARQ** y cliente estándar `redis.asyncio`. Erradicación total del antipatrón `DynamicRedisClient` y eliminación absoluta de `asyncio.run()`, permitiendo ejecución concurrente no bloqueante de alto rendimiento.
 4. **Ciclo de Vida de Workers (`WorkerSettings` & Inyección de Contexto):** Inicialización única de conexiones MongoDB (`Beanie ODM`) y pool HTTP (`httpx.AsyncClient`) en el `on_startup` del worker, e inyección en `ctx` para reutilización eficiente entre miles de tareas.
 5. **Control de Acceso Basado en Roles por Dominios (IAM & PyCasbin):** Autorización RBAC multi-tenant con dominios (`sub, dom, obj, act`) gestionada en MongoDB (`casbin-motor-adapter`), bootstrapping automático de Superadmin y dependencia declarativa `CasbinAuth`.
 6. **Autenticación JWT Segura y Revocación en Tiempo Real:** Hashing `bcrypt`, emisión de tokens JWT firmados con UUID `jti` único y lista negra distribuida en Redis (`tb_revoked_token:{token}`) para invalidación inmediata de sesiones al hacer Logout.
-7. **Políticas de Hardening DevSecOps:** Endpoint `/api/v1/auth/set-password` con tokens de configuración inicial de un solo uso (`setup_token` anti-replay en Redis), política estricta de contraseñas (mínimo 10 caracteres, números y símbolos) y protección anti fuerza bruta (5 intentos fallidos $\to$ HTTP 429 Too Many Requests con bloqueo temporal).
+7. **Políticas de Hardening DevSecOps:** Asignación de contraseña inicial de un solo uso en la creación de cuentas (`POST /api/v1/users`), detección obligatoria en primer login con flag `must_change_password: true`, restricción granular de endpoints de negocio hasta la asignación de contraseña permanente (`POST /api/v1/auth/change-password`), política estricta de contraseñas (mínimo 10 caracteres, números y símbolos) y protección anti fuerza bruta (5 intentos fallidos $\to$ HTTP 429 Too Many Requests con bloqueo temporal).
 8. **Auditoría Estructurada Sanitizada (`AuditLog`):** Registro de auditoría persistente en MongoDB para todas las peticiones mutantes (`POST`, `PUT`, `DELETE`, `PATCH`), enmascarando contraseñas, credenciales y tokens con `"***"`.
 9. **Enrutador Ligero de ARQ & Capa de Servicios:** Tareas asíncronas puras (`async def`) que resuelven dinámicamente `tenant_id` y `TBServer` en MongoDB y delegan la ejecución pesada a la capa de servicios (`core/services/`).
-10. **Renovación Autónoma de Tokens con Persistencia:** Mecanismo resiliente en el ARQ Worker que intercepta errores HTTP 401, renueva el par de tokens (`token` y `refresh_token`) y **actualiza asíncronamente el documento `TBTenant` cifrado en MongoDB** para futuras ejecuciones.
+10. **Renovación Autónoma de Tokens con Persistencia:** Mecanismo resiliente en el ARQ Worker y servicios HTTP que intercepta errores HTTP 401, renueva el par de tokens (`token` y `refresh_token`) y **actualiza asíncronamente los documentos `TBTenant` y `TBServer` cifrados en MongoDB** para futuras ejecuciones.
 11. **Orquestador de Telemetría Masiva y Catálogo TBBackup:** Particionado automático por meses, paginación continua por marcas de tiempo (`ts`), control de concurrencia con semáforos, *checkpoints* en Redis, compresión ZIP en volúmenes locales persistentes y catálogo histórico `TBBackup` en MongoDB.
 12. **Distributed Lock & Heartbeat No Bloqueante (`asyncio.create_task`):** Candado distribuido en Redis (`tb_server_lock:{server_id}`) con Fail Fast (HTTP 409 Conflict) en FastAPI, latido asíncrono (Heartbeat) de renovación cada 30 min (TTL 1 hora) ejecutado como corrutina en segundo plano en el mismo loop del worker y `job_timeout` de 10 días (`864,000s`) para descargas ininterrumpidas de larga duración.
 13. **Automatizaciones y Patrón Dispatcher con Cron Integrado de ARQ (`TBScheduledTask`):** Programación dinámica de tareas en base de datos sin alterar código fuente, resolución periódica cada 1 min mediante `cron(master_dispatcher_task, second=0)` integrado en ARQ (sin requerir daemon de Beat externo), conversión de zonas horarias locales (`America/Mexico_City`) a UTC puro, aislamiento granular ante fallos y disparo manual bajo demanda.
@@ -23,6 +23,8 @@
 16. **Blindaje de E/S Asíncrona, Aislamiento con `asyncio.to_thread()` y Semáforo Global de I/O (`core/io_limiter.py`):** Escritura no bloqueante de fragmentos JSON en streaming con `aiofiles`, delegación de compresión pesada (`shutil.make_archive`) y purga de directorios (`shutil.rmtree`) a hilos secundarios vía `asyncio.to_thread()`, semáforo global `get_zip_semaphore()` para limitar empaquetados simultáneos (máximo 3) y manejo transaccional defensivo con purga inmediata ante fallos de disco (`OSError`, `IOError`).
 17. **Motor de Extracción Híbrido de Telemetría (Local Data Lake + REST API con `ijson` y Delta Calculator):** Comparación dinámica de rangos temporales contra archivos locales en `tenant_backups/<TENANT>/<DEVICE>/<AÑO>/<MES>/`, lectura no bloqueante en streaming con `ijson` delegada a `asyncio.to_thread()` (consumo de RAM $O(1)$), tratamiento de `max_ts` en archivos `.parcial.json` como punto de corte para consultas REST a ThingsBoard (`max_ts + 1`) y consolidación asíncrona concurrente con `aiofiles` en `backups/tmp_<TASK_ID>/` antes del empaquetado ZIP.
 18. **Módulo de Exportación de Telemetría a Excel (`.xlsx`), Whitelist y Control de Memoria (`core/services/excel_report_service.py`):** Persistencia de listas blancas por tenant/dispositivo en `custom_metadata.report_config` (`PUT /api/v1/servers/{server_id}/tenants/{tenant_id}/report-config`), DTO `ExcelReportRequest` con validación mutuamente exclusiva de fechas exactas o año/mes dinámico (`calendar.monthrange`), resolución de Sitios y Dispositivos sin N+1 mediante Entity Query (`/api/entitiesQuery/find`), tarea ARQ `generate_excel_report_task` con filtrado estricto antes de construir DataFrames de Pandas, y gestión agresiva de memoria e I/O no bloqueante con `asyncio.to_thread()` (`combine_in_single_file == True` genera un `.xlsx` multi-hoja; `False` genera múltiples `.xlsx` con `gc.collect()` tras cada archivo, empaquetado en `.zip` y purga de residuales).
+19. **Monitoreo de Infraestructura y Métricas de Sistema (`GET /api/admin/systemInfo` y `tasks.collect_servers_system_info`):** Recolección programable o bajo demanda del uso de CPU, memoria RAM y almacenamiento en disco desde ThingsBoard para todos los servidores o instancias específicas, prevención de arranque en frío para Sysadmin, persistencia de `last_system_info` en `custom_metadata` y auto-renovación resiliente ante 401.
+
 
 ---
 
@@ -177,9 +179,10 @@ Thingsboard_Api/
 │   ├── security.py                    # Funciones criptográficas bcrypt, tokens de configuración y JWT con jti único
 │   ├── tb_client.py                   # Cliente dinámico ThingsBoardClient(base_url, credentials)
 │   ├── models/                        # Modelos de documentos Beanie (MongoDB)
-│   │   ├── __init__.py                # Exportación de User, TBServer, TBTenant, TBBackup, AuditLog, TBScheduledTask
+│   │   ├── __init__.py                # Exportación de User, TBServer, TBTenant, TBNode, TBBackup, AuditLog, TBScheduledTask
 │   │   ├── user.py                    # Modelo User (username, email, hashed_password, role, is_active, is_superuser)
-│   │   ├── tb_server.py               # Modelo TBServer (Infraestructura, base_url, rate_limits)
+│   │   ├── tb_server.py               # Modelo TBServer (Host principal/master, SSH nativo, base_url, rate_limits)
+│   │   ├── tb_node.py                 # Modelo TBNode (Nodos secundarios en cluster: server_id Link, SSH nativo, rol y credenciales Fernet)
 │   │   ├── tb_tenant.py               # Modelo TBTenant (server_id Link, credenciales y tokens cifrados Fernet)
 │   │   ├── tb_backup.py               # Modelo TBBackup (Catálogo de respaldos: tenant_id Link, task_id, requested_by, fechas, tamaño)
 │   │   ├── tb_scheduled_task.py       # Modelo TBScheduledTask (Automatizaciones con expresiones cron)
@@ -347,36 +350,41 @@ backups/
 - **Método:** `POST` | **Ruta:** `/api/v1/auth/login`
 - **Cuerpo (Form Data):** `username`, `password`
 - **Protección Fuerza Bruta:** Bloqueo temporal tras 5 intentos fallidos (HTTP 429).
+- **Inyección Cookie HttpOnly:** Establece cookie segura `access_token` para clientes basados en navegador.
 - **Respuesta (200 OK):**
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "token_type": "bearer",
   "user_id": "6a8cf6b4b165bf33192e1d54",
-  "username": "user_a"
+  "username": "user_a",
+  "must_change_password": false,
+  "message": null
 }
 ```
+*Si el usuario inicia sesión con una contraseña de un solo uso, `must_change_password` será `true` y los endpoints de negocio quedarán bloqueados (HTTP 403) hasta que defina su contraseña permanente.*
 
-#### 2. Perfil del Usuario Actual
-- **Método:** `GET` | **Ruta:** `/api/v1/auth/me`
-- **Cabecera:** `Authorization: Bearer <ACCESS_TOKEN>`
-- **Respuesta (200 OK):** Objeto `UserResponse`.
-
-#### 3. Cierre de Sesión (Logout con Revocación en Redis)
-- **Método:** `POST` | **Ruta:** `/api/v1/auth/logout`
-- **Cabecera:** `Authorization: Bearer <ACCESS_TOKEN>`
-- **Efecto:** Registra el token en `tb_revoked_token:{token}` con TTL restante.
-
-#### 4. Configuración de Contraseña Inicial (Set-Password con Setup Token)
-- **Método:** `POST` | **Ruta:** `/api/v1/auth/set-password`
+#### 2. Cambio de Contraseña / Primer Login (`/api/v1/auth/change-password`)
+- **Método:** `POST` | **Ruta:** `/api/v1/auth/change-password`
+- **Cabecera:** `Authorization: Bearer <ACCESS_TOKEN>` (o Cookie HttpOnly)
 - **Cuerpo:**
 ```json
 {
-  "setup_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "new_password": "SuperPassword2026!#"
+  "new_password": "SuperPermanentPassword2026!#",
+  "current_password": "TempPassword2026!#"
 }
 ```
-- **Protección Anti-Replay:** Consumo único validado en Redis (`tb_used_setup_token:{jti}`).
+- **Efecto:** Valida la política de complejidad estricta, actualiza el hash bcrypt en MongoDB, apaga el flag `must_change_password = False`, e inyecta y retorna un nuevo token JWT sin restricciones.
+
+#### 3. Perfil del Usuario Actual
+- **Método:** `GET` | **Ruta:** `/api/v1/auth/me`
+- **Cabecera:** `Authorization: Bearer <ACCESS_TOKEN>`
+- **Respuesta (200 OK):** Objeto `UserResponse` con estado `must_change_password`.
+
+#### 4. Cierre de Sesión (Logout con Revocación en Redis y Purga de Cookie)
+- **Método:** `POST` | **Ruta:** `/api/v1/auth/logout`
+- **Cabecera:** `Authorization: Bearer <ACCESS_TOKEN>` (o Cookie HttpOnly)
+- **Efecto:** Registra el token en `tb_revoked_token:{token}` con TTL restante y purga la cookie `access_token`.
 
 #### 5. Obtención y Caché de Token ThingsBoard
 - **Método:** `POST` | **Ruta:** `/api/v1/auth/token`
@@ -387,7 +395,7 @@ backups/
 
 ### 6.2. Dominio de Gestión de Usuarios (`/api/v1/users`)
 
-#### 1. Crear Usuario (Emisión de `setup_token`)
+#### 1. Crear Usuario con Contraseña de Un Solo Uso
 - **Método:** `POST` | **Ruta:** `/api/v1/users`
 - **Autorización:** `CasbinAuth(resource="users", action="write")`
 - **Cuerpo:**
@@ -395,12 +403,14 @@ backups/
 {
   "username": "operador_bajio",
   "email": "operador@empresa.com",
+  "password": "TempPassword2026!#",
   "role": "operator",
   "is_active": true,
-  "is_superuser": false
+  "is_superuser": false,
+  "must_change_password": true
 }
 ```
-- **Respuesta (201 Created):** Retorna el usuario y el `setup_token` para que configure su contraseña de forma segura.
+- **Respuesta (201 Created):** Retorna el usuario persistido con su hash bcrypt y `must_change_password: true` para que deba cambiar su contraseña inmediatamente en su primer login.
 
 #### 2. Listar Usuarios
 - **Método:** `GET` | **Ruta:** `/api/v1/users`

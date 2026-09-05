@@ -4,7 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from core.models.user import User
+from core.models.tb_server import TBServer
+from core.models.tb_tenant import TBTenant
 from core.casbin_enforcer import get_casbin_enforcer
+from core.roles import RoleScope, RoleDetailResponse, get_available_roles
 from api.deps import CasbinAuth
 
 router = APIRouter()
@@ -75,9 +78,189 @@ class EnforceCheckRequest(BaseModel):
     action: str = Field(..., description="Acción a verificar (ej: read, write)")
 
 
+class DomainScopeFilter(str, Enum):
+    ALL = "all"
+    GLOBAL = "global"
+    SERVER = "server"
+    TENANT = "tenant"
+
+
+class DomainDetailResponse(BaseModel):
+    urn: str = Field(..., description="URN técnico del dominio para Casbin ('*', 'server:<id>', 'tenant:<id>')")
+    domain_id: str = Field(..., description="Identificador único del dominio ('*' o ID de MongoDB)")
+    domain_type: str = Field(..., description="Tipo de dominio ('global', 'server' o 'tenant')")
+    display_name: str = Field(..., description="Nombre amigable y legible para interfaces de usuario (UI/Frontend)")
+    description: Optional[str] = Field(default=None, description="Descripción o contexto del dominio")
+    server_id: Optional[str] = Field(default=None, description="ID del servidor padre (aplica a tenants)")
+    server_name: Optional[str] = Field(default=None, description="Nombre del servidor ThingsBoard padre (aplica a tenants)")
+    base_url: Optional[str] = Field(default=None, description="URL base de la instancia ThingsBoard (aplica a servidores)")
+    is_active: bool = Field(default=True, description="Estado activo o inactivo del servidor o tenant")
+    active_in_casbin: bool = Field(default=False, description="Indica si este dominio ya posee políticas ('p') o asignaciones ('g') registradas en Casbin")
+
+
 # ==========================================
-# Endpoints de Gestión de Roles
+# Endpoints de Gestión de Roles y Dominios
 # ==========================================
+
+@router.get(
+    "/roles",
+    response_model=List[RoleDetailResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Listar catálogo maestro de roles",
+    description="""
+    Retorna el catálogo completo de roles disponibles en la plataforma con sus nombres legibles para la UI, descripciones, ámbitos y permisos predeterminados.
+
+    ### 🎯 Casos de Uso:
+    - Poblar dinámicamente selectores `<select>` o dropdowns en formularios del Frontend (creación de usuarios, asignación de roles por tenant).
+    - Diferenciar claramente roles globales de plataforma (`scope=system`) de roles multi-tenant (`scope=tenant`).
+    - Consultar los permisos predeterminados asociados a cada rol sin inspeccionar reglas crudas de Casbin.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere permiso Casbin: recurso `iam`, acción `read`.
+    """,
+    responses={
+        200: {
+            "description": "Catálogo de roles recuperado exitosamente.",
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Permisos insuficientes en el IAM (requiere acción 'read' sobre recurso 'iam')."
+        }
+    }
+)
+async def list_available_roles(
+    scope: Optional[RoleScope] = Query(
+        default=None,
+        description="Filtrar roles por ámbito de aplicación ('system', 'tenant' o 'server')"
+    ),
+    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+) -> List[RoleDetailResponse]:
+    """
+    Retorna la lista de roles registrados en el sistema, opcionalmente filtrados por su ámbito.
+    """
+    return get_available_roles(scope=scope)
+
+
+@router.get(
+    "/domains",
+    response_model=List[DomainDetailResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Listar catálogo de dominios disponibles",
+    description="""
+    Retorna el catálogo consolidado de dominios disponibles en la plataforma para el sistema IAM y Casbin (ámbito global '*', servidores ThingsBoard y tenants registrados).
+
+    ### 🎯 Casos de Uso:
+    - Poblar dinámicamente selectores `<select>` o dropdowns de dominios en el Frontend (asignación de roles a usuarios, creación de políticas de acceso granular).
+    - Obtener el URN estandarizado listo para Casbin (`*`, `server:<id>`, `tenant:<id>`) sin necesidad de que el frontend construya strings manualmente.
+    - Conocer el estado del dominio (`is_active`) y si ya tiene reglas o asignaciones vigentes (`active_in_casbin`).
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere permiso Casbin: recurso `iam`, acción `read`.
+    """,
+    responses={
+        200: {
+            "description": "Catálogo de dominios recuperado exitosamente.",
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Permisos insuficientes en el IAM (requiere acción 'read' sobre recurso 'iam')."
+        }
+    }
+)
+async def list_available_domains(
+    scope: Optional[DomainScopeFilter] = Query(
+        default=None,
+        description="Filtrar dominios por tipo ('global', 'server', 'tenant' o 'all')"
+    ),
+    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+) -> List[DomainDetailResponse]:
+    """
+    Retorna la lista de dominios disponibles (global, servidores y tenants) con sus URNs listos para Casbin.
+    """
+    enforcer = get_casbin_enforcer()
+    active_doms = set()
+    try:
+        for p in enforcer.get_policy():
+            if len(p) >= 2:
+                active_doms.add(p[1])
+        for g in enforcer.get_grouping_policy():
+            if len(g) >= 3:
+                active_doms.add(g[2])
+    except Exception:
+        pass
+
+    scope_val = scope.value if isinstance(scope, DomainScopeFilter) else (str(scope).lower() if scope else "all")
+
+    domains: List[DomainDetailResponse] = []
+
+    # 1. Dominio Global (*)
+    if scope_val in ("all", "global"):
+        domains.append(
+            DomainDetailResponse(
+                urn="*",
+                domain_id="*",
+                domain_type="global",
+                display_name="Global / Toda la Plataforma (*)",
+                description="Aplica de manera irrestricta a todos los servidores y tenants del sistema",
+                is_active=True,
+                active_in_casbin="*" in active_doms
+            )
+        )
+
+    # 2. Servidores ThingsBoard (server:<server_id>)
+    server_map: Dict[str, str] = {}
+    if scope_val in ("all", "server", "tenant"):
+        servers = await TBServer.find_all().to_list()
+        for s in servers:
+            s_id = str(s.id)
+            server_map[s_id] = s.name
+            if scope_val in ("all", "server"):
+                urn = f"server:{s_id}"
+                domains.append(
+                    DomainDetailResponse(
+                        urn=urn,
+                        domain_id=s_id,
+                        domain_type="server",
+                        display_name=f"Servidor: {s.name}",
+                        description=s.description or f"Instancia ThingsBoard: {s.base_url}",
+                        base_url=s.base_url,
+                        is_active=s.is_active,
+                        active_in_casbin=urn in active_doms
+                    )
+                )
+
+    # 3. Tenants (tenant:<tenant_id>)
+    if scope_val in ("all", "tenant"):
+        tenants = await TBTenant.find_all().to_list()
+        for t in tenants:
+            t_id = str(t.id)
+            urn = f"tenant:{t_id}"
+            s_id = t.get_server_id_str()
+            s_name = server_map.get(s_id)
+            description_text = f"Tenant en servidor {s_name}" if s_name else "Tenant ThingsBoard"
+            display_name = f"Tenant: {t.name} ({s_name})" if s_name else f"Tenant: {t.name}"
+            domains.append(
+                DomainDetailResponse(
+                    urn=urn,
+                    domain_id=t_id,
+                    domain_type="tenant",
+                    display_name=display_name,
+                    description=description_text,
+                    server_id=s_id if s_id else None,
+                    server_name=s_name,
+                    is_active=t.is_active,
+                    active_in_casbin=urn in active_doms
+                )
+            )
+
+    return domains
+
 
 @router.post("/roles/assign")
 async def assign_role_to_user(

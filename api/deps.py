@@ -13,20 +13,40 @@ from core.logger import logger
 
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl="/api/v1/auth/login",
-    auto_error=True
+    auto_error=False
 )
 
+ALLOWED_PATHS_FOR_PASSWORD_CHANGE = {
+    "/api/v1/auth/change-password",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/me"
+}
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+
+async def get_current_user(
+    request: Request,
+    bearer_token: Optional[str] = Depends(oauth2_scheme)
+) -> User:
     """
-    Dependencia de FastAPI para extraer y validar el JWT del header Authorization.
+    Dependencia de FastAPI para extraer y validar el JWT (desde header Authorization o Cookie HttpOnly).
     Verifica firma, expiración, lista negra en Redis y resuelve el documento User real en MongoDB.
+    Si el usuario tiene pendiente el cambio de contraseña de un solo uso (must_change_password=True),
+    bloquea el acceso a endpoints de negocio hasta que configure su contraseña definitiva.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Credenciales de autenticación inválidas o expiradas",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    token = bearer_token
+    if not token and request.cookies:
+        cookie_token = request.cookies.get("access_token")
+        if cookie_token:
+            token = cookie_token.replace("Bearer ", "").strip()
+
+    if not token:
+        raise credentials_exception
 
     # 1. Verificar si el token ha sido revocado en Redis (Logout)
     try:
@@ -65,6 +85,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     if user is None or not user.is_active:
         raise credentials_exception
+
+    # 4. Validar si el usuario requiere cambio obligatorio de contraseña de un solo uso
+    must_change = payload.get("must_change_password") or user.must_change_password
+    if must_change and not user.is_superuser:
+        req_path = request.url.path.rstrip("/")
+        if not any(req_path == allowed.rstrip("/") for allowed in ALLOWED_PATHS_FOR_PASSWORD_CHANGE):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Debe cambiar su contraseña de un solo uso antes de continuar. Ingrese a /api/v1/auth/change-password para configurar su nueva contraseña permanente."
+            )
 
     return user
 

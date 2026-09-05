@@ -66,37 +66,6 @@ def create_access_token(
     return encoded_jwt
 
 
-def create_password_setup_token(
-    subject: Union[str, Any],
-    expires_delta: Optional[timedelta] = None
-) -> str:
-    """
-    Crea un token JWT de un solo uso para la configuración inicial o restablecimiento de contraseña.
-    Inyecta type="password_setup", sub=subject, jti único y exp por defecto a 24 horas.
-    """
-    now = datetime.now(timezone.utc)
-    if expires_delta:
-        expire = now + expires_delta
-    else:
-        expire = now + timedelta(hours=24)
-
-    to_encode = {
-        "sub": str(subject),
-        "user_id": str(subject),
-        "type": "password_setup",
-        "jti": str(uuid.uuid4()),
-        "iat": int(now.timestamp()),
-        "exp": int(expire.timestamp())
-    }
-
-    encoded_jwt = jwt.encode(
-        to_encode,
-        settings.SECRET_KEY,
-        algorithm=settings.ALGORITHM
-    )
-    return encoded_jwt
-
-
 def validate_password_policy(password: str) -> None:
     """
     Valida que la contraseña cumpla con la política de seguridad estricta:

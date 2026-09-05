@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from beanie import PydanticObjectId
@@ -31,6 +31,8 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user_id: str
     username: str
+    must_change_password: bool = False
+    message: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -40,6 +42,7 @@ class UserResponse(BaseModel):
     role: str = "user"
     is_active: bool = True
     is_superuser: bool = False
+    must_change_password: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -50,9 +53,18 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class SetPasswordRequest(BaseModel):
-    setup_token: str = Field(..., description="Token JWT de un solo uso recibido durante la creación de la cuenta")
-    new_password: str = Field(..., description="Nueva contraseña que cumple con la política de seguridad estricta")
+class ChangePasswordRequest(BaseModel):
+    new_password: str = Field(..., description="Nueva contraseña permanente que cumple con la política estricta de seguridad")
+    current_password: Optional[str] = Field(default=None, description="Contraseña actual de un solo uso (opcional si se envía token Bearer)")
+
+
+class ChangePasswordResponse(BaseModel):
+    status: str = "ok"
+    message: str
+    user_id: str
+    username: str
+    access_token: str
+    token_type: str = "bearer"
 
 
 def _get_client_ip(request: Request) -> str:
@@ -67,15 +79,69 @@ def _get_client_ip(request: Request) -> str:
     return "127.0.0.1"
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    summary="Iniciar sesión OAuth2 / JWT (con protección anti fuerza bruta)",
+    description="""
+Autentica un usuario mediante credenciales estándar OAuth2 (Form Data: `username` y `password`).
+
+### 🛡️ Protección contra Fuerza Bruta y Rate Limiting:
+- **Umbral de Intentos:** Máximo 5 intentos fallidos consecutivos por combinación de `IP` + `username`.
+- **Ventana de Bloqueo:** Tras el 5to intento fallido, el acceso queda **bloqueado temporalmente durante 15 minutos (900 segundos)**.
+- **Respuesta de Bloqueo (`HTTP 429 Too Many Requests`):**
+  - **Cabecera `Retry-After`:** Especifica el número exacto de segundos restantes antes de que expire el bloqueo.
+  - **Mensaje Dinámico:** Retorna el tiempo restante calculado en minutos y segundos (ej. *15 minuto(s) (899 segundos)*).
+- **Desbloqueo Automático:** Tras expirar el tiempo de bloqueo en Redis o ingresar credenciales correctas, el contador se reinicia a 0.
+
+### 🔑 Primer Inicio de Sesión / Contraseña Temporal:
+- Si el usuario fue creado con una contraseña de un solo uso, el token emitido contendrá `must_change_password: true`.
+- En este estado, el usuario tendrá acceso **restringido exclusivamente** a `/api/v1/auth/change-password` hasta que defina su contraseña permanente.
+""",
+    responses={
+        200: {
+            "description": "Autenticación exitosa. Retorna el token JWT en el cuerpo JSON e inyecta la cookie HttpOnly 'access_token'.",
+            "model": TokenResponse
+        },
+        400: {
+            "description": "Cuenta inactiva o deshabilitada.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "La cuenta de usuario se encuentra inactiva o deshabilitada"}
+                }
+            }
+        },
+        401: {
+            "description": "Credenciales inválidas (Usuario o contraseña incorrectos). Incrementa el contador de intentos fallidos.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Usuario o contraseña incorrectos"}
+                }
+            }
+        },
+        429: {
+            "description": "Demasiados intentos fallidos. Acceso bloqueado temporalmente por política anti fuerza bruta (15 minutos).",
+            "headers": {
+                "Retry-After": {
+                    "description": "Número de segundos restantes antes de que expire el bloqueo temporal.",
+                    "schema": {"type": "integer", "example": 899}
+                }
+            },
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "Demasiados intentos fallidos de inicio de sesión. Acceso bloqueado temporalmente. Intente nuevamente en 15 minuto(s) (899 segundos)."
+                    }
+                }
+            }
+        }
+    }
+)
 async def login(
     request: Request,
+    response: Response,
     form_data: OAuth2PasswordRequestForm = Depends()
 ):
-    """
-    Endpoint de inicio de sesión estándar OAuth2 / JWT con protección contra ataques de fuerza bruta.
-    Bloquea la IP/usuario con HTTP 429 tras 5 intentos fallidos en una ventana de 15 minutos.
-    """
     client_ip = _get_client_ip(request)
     rate_limit_key = f"tb_auth_failed:{client_ip}:{form_data.username}"
 
@@ -85,9 +151,11 @@ async def login(
         if failed_attempts and int(failed_attempts) >= MAX_FAILED_LOGIN_ATTEMPTS:
             ttl = await redis_client.ttl(rate_limit_key)
             ttl = max(ttl, 1)
+            minutes = (ttl + 59) // 60
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Demasiados intentos fallidos de inicio de sesión. Acceso bloqueado temporalmente. Intente nuevamente en {ttl} segundos."
+                detail=f"Demasiados intentos fallidos de inicio de sesión. Acceso bloqueado temporalmente. Intente nuevamente en {minutes} minuto(s) ({ttl} segundos).",
+                headers={"Retry-After": str(ttl)}
             )
     except HTTPException:
         raise
@@ -132,122 +200,158 @@ async def login(
         user_data={
             "username": user.username,
             "role": user.role,
-            "is_superuser": user.is_superuser
+            "is_superuser": user.is_superuser,
+            "must_change_password": user.must_change_password
         }
     )
+
+    # Inyectar cookie HttpOnly para sesiones web
+    response.set_cookie(
+        key="access_token",
+        value=f"Bearer {access_token}",
+        httponly=True,
+        samesite="lax",
+        secure=settings.COOKIE_SECURE,
+        path="/",
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+    login_message = None
+    if user.must_change_password:
+        login_message = "Inicio de sesión inicial con contraseña de un solo uso detectado. Debe cambiar su contraseña inmediatamente en /api/v1/auth/change-password."
 
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
         user_id=str(user.id),
-        username=user.username
+        username=user.username,
+        must_change_password=user.must_change_password,
+        message=login_message
     )
 
 
-@router.post("/set-password")
-async def set_password(request: SetPasswordRequest):
-    """
-    Endpoint para establecer o configurar la contraseña inicial mediante un setup_token de un solo uso.
-    Valida la política de complejidad, hashea la contraseña y marca el token como consumido en Redis.
-    """
+@router.post(
+    "/change-password",
+    response_model=ChangePasswordResponse,
+    summary="Cambiar contraseña / Asignar contraseña permanente tras primer login",
+    description="""
+Permite a cualquier usuario autenticado (incluyendo aquellos con `must_change_password: true` en su primer login) 
+configurar o actualizar su contraseña permanente.
+
+### 📋 Requisitos de Seguridad:
+- **Política Estricta:** Mínimo 10 caracteres, al menos un número (0-9) y al menos un símbolo especial.
+- **Validación de Cambio:** La nueva contraseña debe ser distinta a la contraseña temporal / actual.
+- **Desbloqueo de Cuenta:** Apaga el flag `must_change_password = False` en MongoDB y emite un nuevo token JWT sin restricciones.
+""",
+    responses={
+        200: {
+            "description": "Contraseña actualizada exitosamente. Retorna el nuevo JWT definitivo y actualiza la cookie HttpOnly.",
+            "model": ChangePasswordResponse
+        },
+        400: {
+            "description": "Contraseña no cumple la política estricta, la contraseña actual es incorrecta, o la nueva contraseña es idéntica a la actual.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "La contraseña no cumple con la política de seguridad: debe tener al menos 10 caracteres"}
+                }
+            }
+        },
+        401: {
+            "description": "No autenticado o token revocado / expirado.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "No autenticado"}
+                }
+            }
+        }
+    }
+)
+async def change_password(
+    request: ChangePasswordRequest,
+    response: Response,
+    current_user: User = Depends(get_current_user)
+):
     # 1. Validar política estricta de complejidad
     validate_password_policy(request.new_password)
 
-    # 2. Decodificar y validar criptográficamente el setup_token
-    try:
-        payload = decode_access_token(request.setup_token)
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Token de configuración inválido o expirado"
-        )
-
-    token_type = payload.get("type")
-    if token_type != "password_setup":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El token proporcionado no es un token válido de configuración de contraseña"
-        )
-
-    jti = payload.get("jti")
-    user_id = payload.get("sub") or payload.get("user_id")
-
-    if not user_id or not jti:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payload del token de configuración incompleto o inválido"
-        )
-
-    # 3. Garantizar un solo uso mediante verificación en Redis
-    used_key = f"tb_used_setup_token:{jti}"
-    try:
-        is_used = await redis_client.get(used_key)
-        if is_used:
+    # 2. Si se proporciona current_password, verificar coincidencia
+    if request.current_password:
+        if not current_user.hashed_password or not verify_password(request.current_password, current_user.hashed_password):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Este token de configuración ya ha sido utilizado previamente"
+                detail="La contraseña actual proporcionada es incorrecta"
             )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"[SetPassword] No se pudo verificar reuso de token en Redis: {e}")
 
-    # 4. Buscar usuario en MongoDB
-    user: Optional[User] = None
-    try:
-        user = await User.get(PydanticObjectId(user_id))
-    except Exception:
-        pass
-
-    if not user:
-        user = await User.find_one(User.username == user_id)
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuario no encontrado"
-        )
-
-    if not user.is_active:
+    # 3. Validar que la nueva contraseña sea diferente a la actual
+    if current_user.hashed_password and verify_password(request.new_password, current_user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="La cuenta de usuario se encuentra inactiva o deshabilitada"
+            detail="La nueva contraseña debe ser diferente a la contraseña actual"
         )
 
-    # 5. Hashear con bcrypt y persistir contraseña
-    user.hashed_password = get_password_hash(request.new_password)
-    user.updated_at = datetime.now(timezone.utc)
-    await user.save()
+    # 4. Hashear y persistir nueva contraseña permanente
+    current_user.hashed_password = get_password_hash(request.new_password)
+    current_user.must_change_password = False
+    current_user.updated_at = datetime.now(timezone.utc)
+    await current_user.save()
 
-    # 6. Marcar el jti como consumido en Redis con el TTL remanente del JWT
-    exp_ts = payload.get("exp", int(datetime.now(timezone.utc).timestamp()) + 86400)
-    current_ts = int(datetime.now(timezone.utc).timestamp())
-    ttl = max(exp_ts - current_ts, 3600)
-    try:
-        await redis_client.setex(used_key, ttl, "used")
-    except Exception as e:
-        logger.warning(f"[SetPassword] No se pudo registrar token usado en Redis: {e}")
+    # 5. Emitir nuevo access_token definitivo
+    new_access_token = create_access_token(
+        subject=str(current_user.id),
+        user_data={
+            "username": current_user.username,
+            "role": current_user.role,
+            "is_superuser": current_user.is_superuser,
+            "must_change_password": False
+        }
+    )
 
-    return {
-        "status": "ok",
-        "message": f"Contraseña configurada exitosamente para el usuario '{user.username}'",
-        "user_id": str(user.id)
-    }
+    # Inyectar cookie HttpOnly actualizada
+    response.set_cookie(
+        key="access_token",
+        value=f"Bearer {new_access_token}",
+        httponly=True,
+        samesite="lax",
+        secure=settings.COOKIE_SECURE,
+        path="/",
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+    return ChangePasswordResponse(
+        status="ok",
+        message=f"Contraseña actualizada exitosamente para el usuario '{current_user.username}'.",
+        user_id=str(current_user.id),
+        username=current_user.username,
+        access_token=new_access_token,
+        token_type="bearer"
+    )
 
 
 @router.post("/logout")
 async def logout(
-    token: str = Depends(oauth2_scheme),
+    request: Request,
+    response: Response,
+    bearer_token: Optional[str] = Depends(oauth2_scheme),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Cierra la sesión del usuario revocando el token JWT en Redis mediante lista negra.
+    Cierra la sesión del usuario revocando el token JWT en Redis mediante lista negra
+    y eliminando la cookie HttpOnly en el cliente.
     """
-    ttl_seconds = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    try:
-        await redis_client.setex(f"tb_revoked_token:{token}", ttl_seconds, "revoked")
-    except Exception:
-        pass
+    token = bearer_token
+    if not token and request.cookies:
+        cookie_token = request.cookies.get("access_token")
+        if cookie_token:
+            token = cookie_token.replace("Bearer ", "").strip()
+
+    if token:
+        ttl_seconds = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        try:
+            await redis_client.setex(f"tb_revoked_token:{token}", ttl_seconds, "revoked")
+        except Exception:
+            pass
+
+    response.delete_cookie(key="access_token", path="/")
 
     return {
         "status": "ok",
@@ -267,6 +371,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
         role=current_user.role,
         is_active=current_user.is_active,
         is_superuser=current_user.is_superuser,
+        must_change_password=current_user.must_change_password,
         created_at=current_user.created_at,
         updated_at=current_user.updated_at
     )

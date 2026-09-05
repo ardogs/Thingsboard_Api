@@ -13,6 +13,7 @@ from api.endpoints.servers import router as servers_router
 from api.endpoints.telemetry import router as telemetry_router
 from api.endpoints.devices import router as devices_router
 from api.endpoints.scheduler import router as scheduler_router
+from fastapi.middleware.cors import CORSMiddleware
 from api.middlewares.audit_log import AuditLogMiddleware
 
 
@@ -39,6 +40,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Configuración de CORS con soporte de credenciales
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Middleware de Auditoría y Trazabilidad DevSecOps
 app.add_middleware(AuditLogMiddleware)
 
@@ -56,7 +66,7 @@ app.include_router(auth_router, prefix="/api/auth", include_in_schema=False)
 app.include_router(telemetry_router, prefix="/api/telemetry", include_in_schema=False)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "POST"])
 async def root():
     return {
         "status": "ok",
