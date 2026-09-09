@@ -340,14 +340,34 @@ async def run_incremental_tenant_backup(payload: dict) -> dict:
             payload=payload
         )
 
-    # Parámetros temporales
+    # Parámetros temporales (soporta start_ts/end_ts o bien year/month numéricos o cadenas)
     start_ts = payload.get("start_ts")
     end_ts = payload.get("end_ts")
-    year_str = str(payload.get("year_str") or "")
-    month_str = str(payload.get("month_str") or "")
+    raw_year = payload.get("year_str") or payload.get("year")
+    raw_month = payload.get("month_str") or payload.get("month")
+
+    if raw_year is not None and raw_month is not None:
+        try:
+            y_int = int(raw_year)
+            m_int = int(raw_month)
+            year_str = f"{y_int:04d}"
+            month_str = f"{m_int:02d}"
+            if not start_ts or not end_ts:
+                _, last_day = calendar.monthrange(y_int, m_int)
+                tz = ZoneInfo(settings.APP_TIMEZONE)
+                s_dt = datetime(y_int, m_int, 1, 0, 0, 0, 0, tzinfo=tz)
+                e_dt = datetime(y_int, m_int, last_day, 23, 59, 59, 999000, tzinfo=tz)
+                start_ts = start_ts or int(s_dt.timestamp() * 1000)
+                end_ts = end_ts or int(e_dt.timestamp() * 1000)
+        except Exception:
+            year_str = str(raw_year)
+            month_str = str(raw_month)
+    else:
+        year_str = str(payload.get("year_str") or "")
+        month_str = str(payload.get("month_str") or "")
 
     if not start_ts or not end_ts or not year_str or not month_str:
-        # Calcular automáticamente si no vienen en el payload
+        # Calcular automáticamente si no vienen en el payload (mes vencido cerrado)
         _, _, s_ts, e_ts, y_str, m_str = calculate_previous_month_boundaries()
         start_ts = start_ts or s_ts
         end_ts = end_ts or e_ts

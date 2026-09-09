@@ -24,6 +24,10 @@
 17. **Motor de Extracción Híbrido de Telemetría (Local Data Lake + REST API con `ijson` y Delta Calculator):** Comparación dinámica de rangos temporales contra archivos locales en `tenant_backups/<TENANT>/<DEVICE>/<AÑO>/<MES>/`, lectura no bloqueante en streaming con `ijson` delegada a `asyncio.to_thread()` (consumo de RAM $O(1)$), tratamiento de `max_ts` en archivos `.parcial.json` como punto de corte para consultas REST a ThingsBoard (`max_ts + 1`) y consolidación asíncrona concurrente con `aiofiles` en `backups/tmp_<TASK_ID>/` antes del empaquetado ZIP.
 18. **Módulo de Exportación de Telemetría a Excel (`.xlsx`), Whitelist y Control de Memoria (`core/services/excel_report_service.py`):** Persistencia de listas blancas por tenant/dispositivo en `custom_metadata.report_config` (`PUT /api/v1/servers/{server_id}/tenants/{tenant_id}/report-config`), DTO `ExcelReportRequest` con validación mutuamente exclusiva de fechas exactas o año/mes dinámico (`calendar.monthrange`), resolución de Sitios y Dispositivos sin N+1 mediante Entity Query (`/api/entitiesQuery/find`), tarea ARQ `generate_excel_report_task` con filtrado estricto antes de construir DataFrames de Pandas, y gestión agresiva de memoria e I/O no bloqueante con `asyncio.to_thread()` (`combine_in_single_file == True` genera un `.xlsx` multi-hoja; `False` genera múltiples `.xlsx` con `gc.collect()` tras cada archivo, empaquetado en `.zip` y purga de residuales).
 19. **Monitoreo de Infraestructura y Métricas de Sistema (`GET /api/admin/systemInfo` y `tasks.collect_servers_system_info`):** Recolección programable o bajo demanda del uso de CPU, memoria RAM y almacenamiento en disco desde ThingsBoard para todos los servidores o instancias específicas, prevención de arranque en frío para Sysadmin, persistencia de `last_system_info` en `custom_metadata` y auto-renovación resiliente ante 401.
+20. **Módulo de Correo Electrónico Asíncrono Dinámico en MongoDB, Singleton y Gestión de Adjuntos (`core/models/tb_email_config.py`, `core/services/email_service.py`, `workers.tasks.send_email_task` y `api/endpoints/utils/router.py`):** Persistencia y gestión dinámica de credenciales SMTP en MongoDB con contraseñas cifradas simétricamente mediante Fernet (`TBEmailConfig`). **Restricción Singleton estricta:** Solo puede existir una única configuración en todo el sistema (`singleton_key` único en BD e interceptación HTTP 409 Conflict ante intentos de duplicado). Endpoints CRUD RESTful puros sin requerir ID (`GET /api/v1/utils/email-config`, `POST /api/v1/utils/email-config`, `PUT /api/v1/utils/email-config`, `DELETE /api/v1/utils/email-config` y `POST /api/v1/utils/email-config/test`). Construcción RFC 2046 de mensajes `MIMEMultipart` (mixed + alternative + `MIMEBase`), lectura no bloqueante de adjuntos locales en disco con `aiofiles` sin saturar la memoria de Redis (paso exclusivo de `attachment_paths`), tarea ARQ con `arq.Retry` explícito y retroceso exponencial ante fallos transitorios, y bloque `finally:` con eliminación asíncrona no bloqueante (`asyncio.to_thread(os.remove)`) de archivos temporales tras envío exitoso o fallo definitivo.
+21. **Módulo de Reportes de Mapas de Calor (Heatmaps) en PDF, Aislamiento de CPU y Reglas Seguras (`core/services/heatmap_report_service.py`, `workers/tasks.generate_monthly_heatmap_task` y `POST /api/v1/telemetry/report/heatmap`):** Generación de reportes de cumplimiento y telemetría mensual en PDF. Cuadrícula uniforme con celdas cuadradas mediante `seaborn.heatmap(square=True)` y ajuste dinámico de `figsize` según las dimensiones de la matriz. Mapeo 100% seguro de reglas mediante el módulo nativo `operator` de Python (`>=`, `<=`, `>`, `<`, `==`, `!=`), erradicando absolutamente el uso de `eval()`. Aislamiento estricto de CPU mediante `ProcessPoolExecutor` y `asyncio.get_running_loop().run_in_executor()` para evitar bloqueo del GIL del worker de ARQ, con `matplotlib.pyplot.close('all')` y `gc.collect()` tras generar cada imagen. Tarea ARQ que resuelve `TBTenant` y `TBServer`, filtra dispositivos por `heatmap_active == True` en atributos de servidor, lee la lista blanca `custom_metadata.heatmap_config` y extrae telemetría vía REST API. Almacenamiento temporal en `backups/heatmaps/{task_id}_{tenant_name}_heatmap.pdf`, registro en catálogo `TBBackup` en MongoDB y bloque `finally:` para liberación de distributed lock y limpieza defensiva del entorno.
+
+
 
 
 ---
@@ -160,16 +164,19 @@ Thingsboard_Api/
 │       ├── devices/                   # Dominio de Dispositivos y Aprovisionamiento (/api/v1/tenants/{tenant_id}/devices)
 │       │   ├── __init__.py
 │       │   └── router.py              # Listado y aprovisionamiento masivo por Tenant
-│       └── scheduler/                 # Dominio de Automatizaciones y Tareas Programadas (/api/v1/scheduler/tasks)
+│       ├── scheduler/                 # Dominio de Automatizaciones y Tareas Programadas (/api/v1/scheduler/tasks)
+│       │   ├── __init__.py
+│       │   ├── schemas.py             # DTOs Pydantic v2 (ScheduledTaskCreate/Update/Response) con validación croniter
+│       │   └── router.py              # CRUD de automatizaciones, recálculo cron y trigger manual en ARQ
+│       └── utils/                     # Dominio de Utilidades y Diagnóstico del Sistema (/api/v1/utils)
 │           ├── __init__.py
-│           ├── schemas.py             # DTOs Pydantic v2 (ScheduledTaskCreate/Update/Response) con validación croniter
-│           └── router.py              # CRUD de automatizaciones, recálculo cron y trigger manual en ARQ
+│           └── router.py              # Endpoint protegido /test-email para disparar correos de prueba vía ARQ (HTTP 202)
 ├── core/                              # Capa de infraestructura y configuración del núcleo
 │   ├── __init__.py
 │   ├── arq_pool.py                    # Singleton de conexión ArqRedis (get_arq_pool, close_arq_pool)
 │   ├── bootstrap.py                   # Arranque idempotente y creación de Superadmin inicial + políticas raíz
 │   ├── casbin_enforcer.py             # Instancia global y ciclo de vida de AsyncEnforcer con casbin-motor-adapter
-│   ├── config.py                      # Configuración centralizada (MONGO_URI, REDIS_URL, JWT, ENCRYPTION_KEY, etc.)
+│   ├── config.py                      # Configuración centralizada (MONGO_URI, REDIS_URL, JWT, SMTP_*, etc.)
 │   ├── crypto.py                      # Cifrado simétrico a nivel de aplicación con Fernet (encrypt_data, decrypt_data)
 │   ├── database.py                    # Conexión asíncrona a MongoDB e inicialización de Beanie ODM
 │   ├── io_limiter.py                  # Semáforos de I/O y operaciones no bloqueantes (asyncio.to_thread para ZIP y rmtree)
@@ -186,16 +193,19 @@ Thingsboard_Api/
 │   │   ├── tb_tenant.py               # Modelo TBTenant (server_id Link, credenciales y tokens cifrados Fernet)
 │   │   ├── tb_backup.py               # Modelo TBBackup (Catálogo de respaldos: tenant_id Link, task_id, requested_by, fechas, tamaño)
 │   │   ├── tb_scheduled_task.py       # Modelo TBScheduledTask (Automatizaciones con expresiones cron)
+│   │   ├── tb_email_config.py         # Modelo TBEmailConfig (Configuración SMTP dinámica con contraseñas cifradas Fernet)
 │   │   └── audit_log.py               # Modelo AuditLog (Trazabilidad DevSecOps con payloads sanitizados)
 │   └── services/                      # Servicios de negocio y lógica pesada desacoplada
 │       ├── __init__.py
 │       ├── telemetry_service.py       # Descarga masiva en tmp_{task_id}, checkpoints, catálogo TBBackup y ZIP
-│       └── incremental_backup_service.py # Data Lake de respaldos incrementales (mes vencido), tenacity, semáforos y streaming JSON
+│       ├── incremental_backup_service.py # Data Lake de respaldos incrementales (mes vencido), tenacity, semáforos y streaming JSON
+│       └── email_service.py           # Servicio asíncrono puro de correo SMTP (aiosmtplib) y cascarón MIME (plain y HTML)
 ├── workers/                           # Procesamiento asíncrono en segundo plano (ARQ)
 │   ├── __init__.py
 │   ├── arq_settings.py                # WorkerSettings (on_startup, on_shutdown, cron, timeouts, concurrency)
-│   └── tasks.py                       # Tareas 100% async def (download_telemetry, master_dispatcher, cleanup, incrementales)
+│   └── tasks.py                       # Tareas 100% async def (download_telemetry, send_email_task con Retry, dispatcher)
 ├── scripts/                           # Suites completas de verificación y herramientas auxiliares
+│   ├── verify_email_module.py         # Suite completa de verificación del módulo de correo SMTP, ARQ Retry y HTTP 202
 │   ├── verify_async_io_and_disk_hardening.py # Suite de E/S asíncrona (aiofiles), asyncio.to_thread y semáforos de disco
 │   ├── verify_arq_migration.py        # Suite de pureza asíncrona, WorkerSettings, startup/shutdown y ARQ router
 │   ├── verify_fernet_encryption.py    # Suite de verificación de cifrado simétrico Fernet en MongoDB crudo
@@ -644,7 +654,7 @@ backups/
 #### 1. Crear Tarea Programada
 - **Método:** `POST` | **Ruta:** `/api/v1/scheduler/tasks`
 - **Permiso Casbin:** `resource="scheduler"`, `action="write"`, `domain="server"`
-- **Cuerpo:**
+- **Cuerpo (Ejemplo General):**
 ```json
 {
   "name": "Purga Diaria de Respaldos",
@@ -656,6 +666,33 @@ backups/
   "is_active": true
 }
 ```
+- **Tabla de Parámetros Especiales de `payload` por Tarea:**
+  | Tarea (`task_name`) | Parámetro | Tipo | Default | Obligatorio | Descripción |
+  | :--- | :--- | :--- | :--- | :--- | :--- |
+  | **`tasks.cleanup_old_backups`** | `days_to_keep` | `integer` | `30` | No | Días de antigüedad máxima para conservar respaldos ZIP y registros `TBBackup`. Temporales huérfanos (`tmp_*`) con más de 24h sin escritura son purgados. |
+  | **`tasks.execute_incremental_tenant_backup`** | `tenant_id` | `string` | — | **Sí** | ID de MongoDB del Tenant a respaldar. |
+  | | `concurrency_limit` | `integer` | `4` | No | Concurrencia máxima de descarga de llaves de telemetría. |
+  | | `page_limit` | `integer` | `2000` | No | Tamaño de lote por consulta REST a ThingsBoard. |
+  | | `year` | `integer` | `null` | No | Año específico a respaldar. Si se omite junto con `month`, calcula de forma autónoma el mes cerrado anterior. |
+  | | `month` | `integer` | `null` | No | Mes específico (1-12) a respaldar. |
+  | | `entity_type` | `string` | `'DEVICE'` | No | Tipo de entidad ThingsBoard (`'DEVICE'` o `'ASSET'`). |
+  | | `base_storage_dir` | `string` | `'tenant_backups'` | No | Carpeta raíz del Data Lake persistente. |
+  | **`tasks.collect_servers_system_info`** | `server_id` | `string` | `null` | No | ID en MongoDB del TBServer específico a inspeccionar. `null` consulta todos los servidores registrados. |
+  | **`tasks.download_telemetry`** | `start_date` | `string` | — | Opcional | Fecha inicial ISO-8601 (ej: `'2026-08-01T00:00:00'`). |
+  | | `end_date` | `string` | — | Opcional | Fecha final ISO-8601 (ej: `'2026-08-31T23:59:59'`). |
+  | | `time_zone` | `string` | `'America/Mexico_City'` | No | Zona horaria para delimitar marcas de tiempo. |
+  | | `entity_type` | `string` | `'DEVICE'` | No | Tipo de entidad (`'DEVICE'` o `'ASSET'`). |
+  | | `entity_id` | `string`/`list` | `null` | No | UUID o lista de UUIDs de dispositivos. `null` abarca todos. |
+  | | `concurrency_limit` | `integer` | `3` | No | Concurrencia simultánea de descarga. |
+  | | `page_limit` | `integer` | `2000` | No | Registros por página. |
+  | | `force_reload` | `boolean` | `false` | No | Descartar checkpoints en Redis e iniciar extracción desde cero. |
+  | **`tasks.generate_excel_report`** | `combine_in_single_file` | `boolean` | `true` | No | `true`: archivo `.xlsx` multi-hoja; `false`: empaquetado `.zip` con `.xlsx` individuales. |
+  | | `year` | `integer` | `null` | No | Año del reporte mensual (omite para mes cerrado anterior). |
+  | | `month` | `integer` | `null` | No | Mes del reporte (1-12) (omite para mes cerrado anterior). |
+  | | `start_date` / `end_date` | `string` | `null` | No | Rango exacto ISO si no se usa año/mes. |
+  | | `time_zone` | `string` | `'America/Mexico_City'` | No | Zona horaria para formato de celdas. |
+  | | `concurrency_limit` | `integer` | `3` | No | Concurrencia de extracción de telemetría. |
+  | | `page_limit` | `integer` | `2000` | No | Registros por página REST. |
 - **Respuesta (201 Created):** Objeto `ScheduledTaskResponse` con `next_run_time` inicial calculado en UTC según `settings.APP_TIMEZONE`.
 
 #### 2. Listar Tareas Programadas
@@ -689,6 +726,30 @@ backups/
   "message": "Tarea 'Purga Diaria de Respaldos' despachada exitosamente a ARQ",
   "dispatched_at": "2026-08-26T09:00:00Z"
 }
+```
+
+#### 7. Consultar Catálogo de Tareas Disponibles para Programación
+- **Método:** `GET` | **Ruta:** `/api/v1/scheduler/tasks/available` (Alias: `/available-tasks`, `/api/v1/scheduler/available`)
+- **Permiso Casbin:** `resource="scheduler"`, `action="read"`, `domain="server"`
+- **Parámetros Opcionales de Consulta (Query Params):**
+  - `category` (string, opcional): Filtrar por categoría (`Mantenimiento`, `Respaldos`, `Monitoreo`, `Telemetría`, `Reportes`).
+  - `requires_tenant` (boolean, opcional): Filtrar por aquellas tareas que requieren obligatoriamente un Tenant (`true` o `false`).
+- **Propósito para Frontend:** Retorna el catálogo estructurado con nombre canónico (`task_name`), nombre amigable (`display_name`), descripción, si requiere tenant (`requires_tenant`), expresión cron sugerida (`default_cron`), plantilla de payload (`default_payload`), lista de parámetros esperados (`parameters`) y alias admitidos (`aliases`).
+- **Respuesta (200 OK):** Lista de objetos `AvailableTaskResponse`.
+
+#### 8. Listar Nombres Canónicos de Tareas (`task_name`)
+- **Método:** `GET` | **Ruta:** `/api/v1/scheduler/tasks/task-names` (Alias: `/names`, `/api/v1/scheduler/task-names`)
+- **Permiso Casbin:** `resource="scheduler"`, `action="read"`, `domain="server"`
+- **Propósito para Frontend:** Retorna únicamente el array plano de cadenas de texto con los `task_name` disponibles para poblar de forma directa selectores o listas desplegables en interfaces de usuario.
+- **Respuesta (200 OK):**
+```json
+[
+  "tasks.cleanup_old_backups",
+  "tasks.execute_incremental_tenant_backup",
+  "tasks.collect_servers_system_info",
+  "tasks.download_telemetry",
+  "tasks.generate_excel_report"
+]
 ```
 
 ---
@@ -873,6 +934,9 @@ venv\Scripts\python scripts/verify_scheduler_endpoints.py
 
 # 13. Probar Data Lake de Respaldos Incrementales (Mes Vencido), Tenacity, Semáforos y Streaming JSON
 venv\Scripts\python scripts/verify_incremental_backups.py
+
+# 14. Probar Módulo de Correo Asíncrono Dinámico, Singleton TBEmailConfig, Adjuntos y Endpoints CRUD
+venv\Scripts\python scripts/verify_email_module.py
 ```
 
 ---

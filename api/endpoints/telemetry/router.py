@@ -23,6 +23,7 @@ from core.casbin_enforcer import get_casbin_enforcer
 from api.deps import User, get_current_user
 from workers.tasks import (
     download_telemetry_task,
+    generate_monthly_heatmap_task,
     get_user_stream_channel,
     get_user_registry_key,
     get_server_lock_key
@@ -145,6 +146,14 @@ class ExcelReportRequest(BaseModel):
             self.end_date = end_dt.isoformat()
 
         return self
+
+
+class HeatmapReportRequest(BaseModel):
+    tenant_id: str = Field(..., description="ID de MongoDB del documento TBTenant")
+    year: Optional[int] = Field(default=None, description="Año numérico (ej: 2026)")
+    month: Optional[int] = Field(default=None, description="Mes numérico (1-12)")
+    time_zone: Optional[str] = Field(default=None, description="Zona horaria (default: settings.APP_TIMEZONE)")
+    heatmap_config: Optional[dict] = Field(default=None, description="Configuración personalizada de heatmap (whitelist, reglas, agregación)")
 
 
 class ActiveTaskResponse(BaseModel):
@@ -379,6 +388,105 @@ async def generate_excel_report(
     }
 
 
+@router.post("/report/heatmap", status_code=status.HTTP_200_OK)
+async def generate_heatmap_report_endpoint(
+    request: HeatmapReportRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Inicia una tarea asíncrona de generación de reporte mensual de Mapa de Calor (Heatmap) en PDF.
+    - Resuelve el Tenant y Servidor en MongoDB.
+    - Valida permisos RBAC con Casbin y propiedad del Tenant.
+    - Adquiere distributed lock con fail fast.
+    - Encola la tarea 'generate_monthly_heatmap_task' en ARQ.
+    """
+    # 1. Validar existencia del Tenant en MongoDB
+    try:
+        obj_id = PydanticObjectId(request.tenant_id)
+        tenant_doc = await TBTenant.get(obj_id)
+    except Exception:
+        tenant_doc = await TBTenant.get(request.tenant_id)
+
+    if not tenant_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant de ThingsBoard con ID '{request.tenant_id}' no encontrado en MongoDB"
+        )
+
+    # 2. Validar aislamiento y permisos de usuario (Casbin RBAC + Ownership + Superadmin)
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    is_owner = tenant_doc.user_id in [str(current_user.id), current_user.id]
+    if not is_admin and not is_owner:
+        try:
+            enforcer = get_casbin_enforcer()
+            user_id_str = str(current_user.id)
+            tenant_domain = f"tenant:{tenant_doc.id}"
+            is_allowed = enforcer.enforce(user_id_str, tenant_domain, "telemetry", "write")
+            if not is_allowed and current_user.username:
+                is_allowed = enforcer.enforce(current_user.username, tenant_domain, "telemetry", "write")
+        except Exception:
+            is_allowed = False
+
+        if not is_allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permisos para generar reportes en este Tenant"
+            )
+
+    # 3. Resolver servidor ThingsBoard padre
+    server_doc = await tenant_doc.get_server()
+    if not server_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"El servidor ThingsBoard asociado al Tenant '{tenant_doc.name}' no existe o fue eliminado"
+        )
+
+    # 4. Adquisición Atómica del Candado Distribuido
+    server_id = str(server_doc.id)
+    lock_key = get_server_lock_key(server_id)
+    lock_acquired = await redis_client.set(lock_key, "locked", nx=True, ex=300)
+    if not lock_acquired:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El servidor ThingsBoard se encuentra actualmente ocupado procesando otra tarea. Por favor, intente más tarde."
+        )
+
+    # 5. Preparar payload para ARQ
+    task_payload = {
+        "tenant_id": str(tenant_doc.id),
+        "tenant_name": tenant_doc.name,
+        "server_id": server_id,
+        "server_url": server_doc.base_url,
+        "year": request.year,
+        "month": request.month,
+        "time_zone": request.time_zone or settings.APP_TIMEZONE,
+        "heatmap_config": request.heatmap_config,
+        "user_id": str(current_user.id)
+    }
+
+    # 6. Encolar la tarea en ARQ
+    try:
+        arq_pool = await get_arq_pool()
+        job = await arq_pool.enqueue_job(
+            "generate_monthly_heatmap_task",
+            tenant_id=str(tenant_doc.id),
+            payload=task_payload
+        )
+        job_id = job.job_id if job else "unknown_job"
+    except Exception as e:
+        await redis_client.delete(lock_key)
+        raise e
+
+    return {
+        "task_id": job_id,
+        "status": "Task enqueued",
+        "user_id": str(current_user.id),
+        "tenant_id": str(tenant_doc.id),
+        "tenant_name": tenant_doc.name,
+        "server_id": server_id,
+        "server_url": server_doc.base_url
+    }
+
 
 @router.get("/tasks/active", response_model=List[ActiveTaskResponse])
 async def get_active_tasks(current_user: User = Depends(get_current_user)):
@@ -596,11 +704,18 @@ async def download_file(
                 )
 
         file_path = os.path.join(backup_dir, backup_doc.file_name)
+        if not os.path.exists(file_path):
+            heatmap_path = os.path.join(backup_dir, "heatmaps", backup_doc.file_name)
+            if os.path.exists(heatmap_path):
+                file_path = heatmap_path
+
         if os.path.exists(file_path):
             if backup_doc.file_name.endswith(".xlsx"):
                 media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             elif backup_doc.file_name.endswith(".zip"):
                 media_type = "application/zip"
+            elif backup_doc.file_name.endswith(".pdf"):
+                media_type = "application/pdf"
             else:
                 guessed, _ = mimetypes.guess_type(backup_doc.file_name)
                 media_type = guessed or "application/octet-stream"
@@ -612,15 +727,30 @@ async def download_file(
             )
 
     # 2. Fallback de compatibilidad si el archivo existe en disco
-    for filename in os.listdir(backup_dir):
-        if (filename.startswith(f"{task_id}_") or filename.endswith(f"_{task_id}.zip") or filename.endswith(f"_{task_id}.xlsx") or task_id in filename) and (filename.endswith(".zip") or filename.endswith(".xlsx")):
-            file_path = os.path.join(backup_dir, filename)
-            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if filename.endswith(".xlsx") else "application/zip"
-            return FileResponse(
-                path=file_path,
-                media_type=media_type,
-                filename=filename
-            )
+    search_dirs = [backup_dir, os.path.join(backup_dir, "heatmaps")]
+    for s_dir in search_dirs:
+        if os.path.exists(s_dir):
+            for filename in os.listdir(s_dir):
+                is_match = (
+                    filename.startswith(f"{task_id}_")
+                    or filename.endswith(f"_{task_id}.zip")
+                    or filename.endswith(f"_{task_id}.xlsx")
+                    or filename.endswith(f"_{task_id}.pdf")
+                    or task_id in filename
+                )
+                if is_match and (filename.endswith(".zip") or filename.endswith(".xlsx") or filename.endswith(".pdf")):
+                    file_path = os.path.join(s_dir, filename)
+                    if filename.endswith(".xlsx"):
+                        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    elif filename.endswith(".pdf"):
+                        media_type = "application/pdf"
+                    else:
+                        media_type = "application/zip"
+                    return FileResponse(
+                        path=file_path,
+                        media_type=media_type,
+                        filename=filename
+                    )
 
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,

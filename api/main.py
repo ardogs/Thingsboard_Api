@@ -13,6 +13,7 @@ from api.endpoints.servers import router as servers_router
 from api.endpoints.telemetry import router as telemetry_router
 from api.endpoints.devices import router as devices_router
 from api.endpoints.scheduler import router as scheduler_router
+from api.endpoints.utils import router as utils_router
 from fastapi.middleware.cors import CORSMiddleware
 from api.middlewares.audit_log import AuditLogMiddleware
 
@@ -60,10 +61,14 @@ app.include_router(servers_router, prefix="/api/v1/servers", tags=["Servidores T
 app.include_router(telemetry_router, prefix="/api/v1/telemetry", tags=["Telemetría"])
 app.include_router(devices_router, prefix="/api/v1/tenants", tags=["Dispositivos y Aprovisionamiento"])
 app.include_router(scheduler_router, prefix="/api/v1/scheduler/tasks", tags=["Scheduler y Tareas Programadas"])
+app.include_router(utils_router, prefix="/api/v1/utils", tags=["Utilidades y Sistema"])
 
-# Compatibilidad con rutas v0 / legacy
+# Compatibilidad con rutas v0 / legacy y alias de conveniencia
 app.include_router(auth_router, prefix="/api/auth", include_in_schema=False)
 app.include_router(telemetry_router, prefix="/api/telemetry", include_in_schema=False)
+app.include_router(scheduler_router, prefix="/api/v1/scheduler", tags=["Scheduler y Tareas Programadas"], include_in_schema=False)
+app.include_router(utils_router, prefix="/api/v1", include_in_schema=False)
+app.include_router(utils_router, prefix="/api/utils", include_in_schema=False)
 
 
 @app.api_route("/", methods=["GET", "POST"])

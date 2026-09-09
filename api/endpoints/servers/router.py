@@ -703,6 +703,7 @@ async def delete_server_tenant(
 
 
 @router.post("/{server_id}/tenants/{tenant_id}/test-connection")
+@router.get("/{server_id}/tenants/{tenant_id}/test-connection")
 async def test_tenant_connection(
     server_id: str,
     tenant_id: str,

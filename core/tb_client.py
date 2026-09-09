@@ -244,6 +244,39 @@ class ThingsBoardClient:
             response.raise_for_status()
             return response.json()
 
+    async def get_entity_attributes(
+        self,
+        entity_id: str,
+        scope: Optional[str] = "SERVER_SCOPE",
+        keys: Optional[str] = None,
+        entity_type: str = "DEVICE",
+        token: Optional[str] = None
+    ) -> list[dict]:
+        """
+        Obtiene los atributos de una entidad en ThingsBoard.
+        Por defecto consulta SERVER_SCOPE en /api/plugins/telemetry/{entityType}/{entityId}/values/attributes/SERVER_SCOPE.
+        """
+        tok = self._resolve_token(token)
+        url = (
+            f"{self.base_url}/api/plugins/telemetry/{entity_type}/{entity_id}/values/attributes/{scope}"
+            if scope
+            else f"{self.base_url}/api/plugins/telemetry/{entity_type}/{entity_id}/values/attributes"
+        )
+        params = {}
+        if keys:
+            params["keys"] = keys
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                url,
+                headers={"X-Authorization": f"Bearer {tok}"},
+                params=params
+            )
+            if response.status_code == 200:
+                return response.json()
+            response.raise_for_status()
+            return []
+
     async def find_entities_by_query(
         self,
         query: dict,

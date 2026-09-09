@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -51,6 +52,16 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------------------
     CASBIN_MODEL_PATH: str = Field(..., description="Ruta al modelo RBAC de Casbin")
     CASBIN_COLLECTION_NAME: str = Field(..., description="Nombre de la colección para las reglas de Casbin")
+
+    # --------------------------------------------------------------------------
+    # Configuración de Servidor de Correo SMTP
+    # --------------------------------------------------------------------------
+    SMTP_HOST: str = Field(default="localhost", description="Host o FQDN del servidor SMTP")
+    SMTP_PORT: int = Field(default=587, ge=1, le=65535, description="Puerto del servidor SMTP (ej: 587 para STARTTLS, 465 para SSL/TLS)")
+    SMTP_USER: str = Field(default="", description="Usuario para autenticación SMTP")
+    SMTP_PASSWORD: str = Field(default="", description="Contraseña para autenticación SMTP")
+    SMTP_TLS: bool = Field(default=True, description="Flag para habilitar TLS/STARTTLS en la conexión SMTP")
+    SMTP_FROM_EMAIL: Optional[str] = Field(default=None, description="Dirección remitente por defecto para envíos de correo")
 
     # Configuración del motor de Pydantic Settings v2
     model_config = SettingsConfigDict(

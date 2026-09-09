@@ -10,10 +10,12 @@ from core.logger import logger
 from workers.tasks import (
     download_telemetry_task,
     generate_excel_report_task,
+    generate_monthly_heatmap_task,
     master_dispatcher_task,
     cleanup_old_backups_task,
     execute_incremental_tenant_backup_task,
     collect_servers_system_info_task,
+    send_email_task,
 )
 
 
@@ -58,6 +60,8 @@ REGISTERED_FUNCTIONS = [
     func(download_telemetry_task, name="tasks.download_telemetry"),
     generate_excel_report_task,
     func(generate_excel_report_task, name="tasks.generate_excel_report"),
+    generate_monthly_heatmap_task,
+    func(generate_monthly_heatmap_task, name="tasks.generate_monthly_heatmap"),
     master_dispatcher_task,
     func(master_dispatcher_task, name="tasks.master_dispatcher"),
     cleanup_old_backups_task,
@@ -66,6 +70,8 @@ REGISTERED_FUNCTIONS = [
     func(execute_incremental_tenant_backup_task, name="tasks.execute_incremental_tenant_backup"),
     collect_servers_system_info_task,
     func(collect_servers_system_info_task, name="tasks.collect_servers_system_info"),
+    send_email_task,
+    func(send_email_task, name="tasks.send_email"),
 ]
 
 

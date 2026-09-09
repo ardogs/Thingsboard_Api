@@ -1,0 +1,379 @@
+from datetime import datetime, timezone
+from typing import Optional, List
+from fastapi import APIRouter, Depends, status, HTTPException, Query
+
+from core.arq_pool import get_arq_pool
+from core.config import settings
+from core.logger import logger
+from core.models.user import User
+from core.models.tb_email_config import TBEmailConfig
+from api.deps import get_current_user
+from api.endpoints.utils.schemas import (
+    EmailConfigCreateRequest,
+    EmailConfigUpdateRequest,
+    EmailConfigResponse,
+    EmailConfigTestRequest,
+    TestEmailRequest,
+    TestEmailResponse,
+)
+
+router = APIRouter()
+
+
+def _to_config_response(config: TBEmailConfig) -> EmailConfigResponse:
+    """Transforma un documento TBEmailConfig en un DTO de respuesta seguro."""
+    return EmailConfigResponse(
+        id=str(config.id),
+        host=config.host,
+        port=config.port,
+        username=config.username,
+        has_password=bool(config.encrypted_password),
+        use_tls=config.use_tls,
+        sender_email=config.sender_email,
+        sender_name=config.sender_name,
+        is_active=config.is_active,
+        created_at=config.created_at,
+        updated_at=config.updated_at,
+    )
+
+
+
+# =============================================================================
+# Helper Interno para Actualización de Configuración
+# =============================================================================
+
+async def _apply_config_update(
+    config: TBEmailConfig,
+    payload: EmailConfigUpdateRequest,
+    current_user: User
+) -> EmailConfigResponse:
+    """Aplica modificaciones parciales a un documento TBEmailConfig y persiste en MongoDB."""
+    if payload.host is not None:
+        config.host = payload.host
+    if payload.port is not None:
+        config.port = payload.port
+    if payload.username is not None:
+        config.username = payload.username
+    if payload.use_tls is not None:
+        config.use_tls = payload.use_tls
+    if payload.sender_email is not None:
+        config.sender_email = payload.sender_email
+    if payload.sender_name is not None:
+        config.sender_name = payload.sender_name
+    if payload.is_active is not None:
+        config.is_active = payload.is_active
+
+    # Cifrado de nueva contraseña en RAM si fue provista
+    if payload.password is not None:
+        await config.set_password(payload.password)
+
+    config.updated_at = datetime.now(timezone.utc)
+    await config.save()
+
+    logger.info(
+        f"[EmailConfig API] Configuración SMTP '{config.id}' actualizada exitosamente por '{current_user.username}'"
+    )
+    return _to_config_response(config)
+
+
+async def _enqueue_test_email(
+    config: TBEmailConfig,
+    payload: EmailConfigTestRequest,
+    current_user: User
+) -> TestEmailResponse:
+    """Encola un correo de prueba en ARQ utilizando una configuración específica."""
+    subject = payload.subject or f"Prueba de Configuración SMTP ({config.host}) - ThingsBoard Super API Gateway"
+    html_body = payload.html_body or f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
+        <h2 style="color: #0284c7;">ThingsBoard Super API Gateway</h2>
+        <p>Prueba de conectividad para el servidor SMTP configurado en MongoDB.</p>
+        <ul>
+            <li><strong>Host:</strong> {config.host}:{config.port}</li>
+            <li><strong>Usuario:</strong> {config.username}</li>
+            <li><strong>TLS:</strong> {'Habilitado' if config.use_tls else 'Deshabilitado'}</li>
+            <li><strong>Solicitado por:</strong> {current_user.email or current_user.username}</li>
+            <li><strong>Fecha:</strong> {datetime.now(timezone.utc).isoformat()} UTC</li>
+        </ul>
+    </div>
+    """
+
+    try:
+        arq_pool = await get_arq_pool()
+        job = await arq_pool.enqueue_job(
+            "send_email_task",
+            to_email=str(payload.to_email),
+            subject=subject,
+            html_body=html_body,
+            attachment_paths=payload.attachment_paths,
+            config_id=str(config.id),
+        )
+        task_id = job.job_id if job else None
+    except Exception as exc:
+        logger.error(f"[EmailConfig API] Error al encolar prueba de SMTP en ARQ: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Fallo al encolar la tarea de correo en ARQ: {str(exc)}"
+        )
+
+    return TestEmailResponse(
+        status="ACCEPTED",
+        message=f"Correo de prueba encolado exitosamente utilizando el servidor SMTP '{config.host}:{config.port}'.",
+        task_id=task_id,
+        to_email=str(payload.to_email),
+        subject=subject,
+    )
+
+
+# =============================================================================
+# 1. Endpoints CRUD para la Configuración SMTP Única (Singleton Pattern)
+# =============================================================================
+
+@router.post(
+    "/email-config",
+    response_model=EmailConfigResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear configuración SMTP única",
+    description=(
+        "Almacena la configuración de servidor SMTP en MongoDB con contraseña cifrada vía Fernet. "
+        "RESTRICCIÓN SINGLETON: Solo puede existir una única configuración en todo el sistema. "
+        "Si ya existe una registrada, retornará HTTP 409 Conflict."
+    )
+)
+@router.post(
+    "/email-configs",
+    response_model=EmailConfigResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear configuración SMTP (alias plural)",
+    include_in_schema=False
+)
+async def create_email_config(
+    payload: EmailConfigCreateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Crea la configuración SMTP única del sistema en MongoDB."""
+    if await TBEmailConfig.exists_config():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Ya existe una configuración SMTP registrada en el sistema. "
+                "Solo se permite una única configuración. Utilice PUT /api/v1/utils/email-config "
+                "para modificarla o DELETE /api/v1/utils/email-config para eliminarla primero."
+            )
+        )
+
+    new_config = TBEmailConfig(
+        singleton_key="global_smtp_config",
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        use_tls=payload.use_tls,
+        sender_email=payload.sender_email or payload.username,
+        sender_name=payload.sender_name,
+        is_active=payload.is_active,
+    )
+
+    # Cifrar la contraseña en RAM antes de persistir
+    await new_config.set_password(payload.password)
+    await new_config.insert()
+
+    logger.info(
+        f"[EmailConfig API] Configuración SMTP única '{new_config.id}' creada exitosamente "
+        f"(Host: {new_config.host}:{new_config.port}, Usuario: {new_config.username}) por '{current_user.username}'"
+    )
+    return _to_config_response(new_config)
+
+
+@router.get(
+    "/email-config",
+    response_model=EmailConfigResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Obtener la configuración SMTP del sistema",
+    description="Retorna la única configuración SMTP registrada en MongoDB sin exponer contraseñas en texto plano."
+)
+async def get_singleton_email_config(
+    current_user: User = Depends(get_current_user),
+):
+    """Consulta la configuración SMTP única del sistema."""
+    config = await TBEmailConfig.get_singleton()
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No se ha registrado ninguna configuración SMTP en el sistema. Debe registrar una mediante POST /api/v1/utils/email-config."
+        )
+    return _to_config_response(config)
+
+
+@router.put(
+    "/email-config",
+    response_model=EmailConfigResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Modificar la configuración SMTP del sistema",
+    description="Actualiza la configuración SMTP única del sistema sin necesidad de especificar un ID en la URL."
+)
+async def update_singleton_email_config(
+    payload: EmailConfigUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Modifica la configuración SMTP única en MongoDB."""
+    config = await TBEmailConfig.get_singleton()
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No existe ninguna configuración SMTP registrada para modificar. Cree una primero mediante POST /api/v1/utils/email-config."
+        )
+    return await _apply_config_update(config, payload, current_user)
+
+
+@router.delete(
+    "/email-config",
+    status_code=status.HTTP_200_OK,
+    summary="Eliminar la configuración SMTP del sistema",
+    description="Elimina de forma permanente la configuración SMTP única del sistema sin necesidad de especificar un ID."
+)
+async def delete_singleton_email_config(
+    current_user: User = Depends(get_current_user),
+):
+    """Elimina la configuración SMTP única del sistema."""
+    config = await TBEmailConfig.get_singleton()
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No existe ninguna configuración SMTP registrada en el sistema para eliminar."
+        )
+    config_id = str(config.id)
+    await config.delete()
+
+    logger.info(
+        f"[EmailConfig API] Configuración SMTP única '{config_id}' eliminada por '{current_user.username}'"
+    )
+    return {
+        "status": "DELETED",
+        "message": "Configuración SMTP eliminada exitosamente del sistema.",
+        "id": config_id
+    }
+
+
+@router.post(
+    "/email-config/test",
+    response_model=TestEmailResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Probar la configuración SMTP del sistema",
+    description="Encola una tarea de envío en ARQ utilizando la configuración SMTP única registrada en el sistema."
+)
+async def test_singleton_email_config(
+    payload: EmailConfigTestRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Prueba la configuración SMTP única del sistema encolando el envío en ARQ."""
+    config = await TBEmailConfig.get_singleton()
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No se puede realizar la prueba: no existe ninguna configuración SMTP registrada en el sistema."
+        )
+    return await _enqueue_test_email(config, payload, current_user)
+
+
+# =============================================================================
+# Rutas de Compatibilidad y Acceso por ID
+# =============================================================================
+
+@router.get(
+    "/email-configs",
+    response_model=List[EmailConfigResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Listar configuraciones SMTP (compatibilidad)",
+    description="Retorna la lista de configuraciones SMTP registradas en MongoDB (máximo 1 debido a la restricción singleton)."
+)
+async def list_email_configs(
+    is_active: Optional[bool] = Query(default=None, description="Filtrar por estado activo"),
+    current_user: User = Depends(get_current_user),
+):
+    """Lista las configuraciones SMTP de la base de datos."""
+    if is_active is not None:
+        configs = await TBEmailConfig.find(TBEmailConfig.is_active == is_active).to_list()
+    else:
+        configs = await TBEmailConfig.find().to_list()
+
+    return [_to_config_response(c) for c in configs]
+
+
+
+# =============================================================================
+# 2. Endpoint General de Diagnóstico / Test de Correo
+# =============================================================================
+
+@router.post(
+    "/test-email",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TestEmailResponse,
+    summary="Disparar envío de correo de prueba de forma asíncrona",
+    description=(
+        "Endpoint protegido para verificar la conectividad del proveedor SMTP activo. "
+        "Encola el trabajo en ARQ sin bloquear el Event Loop y retorna HTTP 202 Accepted de inmediato."
+    )
+)
+@router.post(
+    "/send-test-email",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TestEmailResponse,
+    include_in_schema=False
+)
+async def send_test_email(
+    request: TestEmailRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Encola la tarea send_email_task en el broker de ARQ y responde de inmediato con HTTP 202 Accepted.
+    Garantiza que la API no realice operaciones sincrónicas de E/S con el servidor SMTP.
+    """
+    subject = request.subject or "Prueba de Configuración SMTP - ThingsBoard Super API Gateway"
+
+    html_body = request.html_body
+    if not html_body:
+        html_body = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e0e0e0; border-radius: 8px; background-color: #ffffff;">
+            <h2 style="color: #0284c7; margin-top: 0;">ThingsBoard Super API Gateway</h2>
+            <p style="font-size: 15px; color: #333333;">
+                Este es un correo de prueba emitido de forma 100% asíncrona mediante el worker de <strong>ARQ</strong> y el servicio no bloqueante con <code>aiosmtplib</code>.
+            </p>
+            <div style="background-color: #f8fafc; border-left: 4px solid #0284c7; padding: 12px; margin: 20px 0;">
+                <p style="margin: 4px 0; font-size: 13px;"><strong>Servidor SMTP:</strong> Configuración activa en MongoDB</p>
+                <p style="margin: 4px 0; font-size: 13px;"><strong>Solicitado por:</strong> {current_user.email or current_user.username}</p>
+                <p style="margin: 4px 0; font-size: 13px;"><strong>Timestamp:</strong> {datetime.now(timezone.utc).isoformat()} UTC</p>
+            </div>
+            <p style="font-size: 12px; color: #94a3b8; margin-bottom: 0;">
+                Este mensaje fue generado automáticamente para verificar la infraestructura de notificaciones.
+            </p>
+        </div>
+        """
+
+    try:
+        arq_pool = await get_arq_pool()
+        job = await arq_pool.enqueue_job(
+            "send_email_task",
+            to_email=str(request.to_email),
+            subject=subject,
+            html_body=html_body,
+            text_body=request.text_body,
+            attachment_paths=request.attachment_paths,
+        )
+        task_id = job.job_id if job else None
+        logger.info(
+            f"[API Utils] Correo de prueba hacia '{request.to_email}' encolado exitosamente en ARQ "
+            f"(Job ID: {task_id}) por usuario '{current_user.username}'"
+        )
+    except Exception as exc:
+        logger.error(f"[API Utils] Error al encolar tarea send_email_task en ARQ: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Fallo al encolar la tarea de correo en ARQ: {str(exc)}"
+        )
+
+    return TestEmailResponse(
+        status="ACCEPTED",
+        message="Solicitud de correo electrónico de prueba encolada exitosamente en el worker de ARQ.",
+        task_id=task_id,
+        to_email=str(request.to_email),
+        subject=subject,
+    )
