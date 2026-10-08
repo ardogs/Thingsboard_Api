@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Union, Any
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
@@ -19,6 +19,7 @@ from core.security import (
     validate_password_policy
 )
 from api.deps import get_current_user, oauth2_scheme
+from api.endpoints.users.router import UserResponse, _to_user_response
 
 router = APIRouter()
 
@@ -35,16 +36,24 @@ class TokenResponse(BaseModel):
     message: Optional[str] = None
 
 
-class UserResponse(BaseModel):
-    id: str
-    username: str
-    email: Optional[str] = None
-    role: str = "user"
-    is_active: bool = True
-    is_superuser: bool = False
-    must_change_password: bool = False
-    created_at: datetime
-    updated_at: datetime
+class TenantPermissionsMap(BaseModel):
+    canRead: bool = False
+    canWrite: bool = False
+    canDelete: bool = False
+
+
+class UserTenantAccessResponse(BaseModel):
+    id: str = Field(..., description="ID de MongoDB del Tenant")
+    name: str = Field(..., description="Nombre comercial o identificador del Tenant")
+    server_id: Optional[str] = Field(default=None, description="ID de MongoDB del Servidor ThingsBoard padre")
+    server_name: Optional[str] = Field(default=None, description="Nombre descriptivo del Servidor")
+    server_base_url: Optional[str] = Field(default=None, description="URL base del Servidor ThingsBoard")
+    is_active: bool = Field(default=True, description="Estado de activación del Tenant")
+    role: Optional[str] = Field(default=None, description="Rol asignado en el Tenant (ej. tenant_admin, operator, viewer, custom, superadmin)")
+    permissions: Dict[str, TenantPermissionsMap] = Field(
+        default_factory=dict,
+        description="Permisos efectivos por recurso (ej: telemetry, devices, scheduler)"
+    )
 
 
 class LoginRequest(BaseModel):
@@ -364,17 +373,139 @@ async def get_me(current_user: User = Depends(get_current_user)):
     """
     Retorna el perfil del usuario autenticado actualmente en MongoDB.
     """
-    return UserResponse(
-        id=str(current_user.id),
-        username=current_user.username,
-        email=current_user.email,
-        role=current_user.role,
-        is_active=current_user.is_active,
-        is_superuser=current_user.is_superuser,
-        must_change_password=current_user.must_change_password,
-        created_at=current_user.created_at,
-        updated_at=current_user.updated_at
-    )
+    return _to_user_response(current_user)
+
+
+@router.get("/me/tenants", response_model=List[UserTenantAccessResponse])
+async def get_my_accessible_tenants(
+    current_user: User = Depends(get_current_user)
+) -> List[UserTenantAccessResponse]:
+    """
+    Retorna la lista de tenants accesibles para el usuario autenticado junto con su
+    matriz de permisos efectivos (telemetry, devices, scheduler, etc.) resueltos con Casbin.
+    - Superadministradores: obtienen todos los tenants registrados con acceso completo (*).
+    - Usuarios estándar: evalúa políticas directas (p) y roles por tenant (g).
+    """
+    from core.models.tb_tenant import TBTenant
+    from core.models.tb_server import TBServer
+    from core.casbin_enforcer import get_casbin_enforcer
+
+    servers = await TBServer.find_all().to_list()
+    server_map: dict = {str(s.id): s for s in servers}
+
+    tenants = await TBTenant.find_all().to_list()
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+
+    resources = ["telemetry", "devices", "scheduler"]
+    result: List[UserTenantAccessResponse] = []
+
+    if is_admin:
+        for t in tenants:
+            t_id = str(t.id)
+            srv_id = t.get_server_id_str()
+            srv = server_map.get(srv_id) if srv_id else None
+            result.append(
+                UserTenantAccessResponse(
+                    id=t_id,
+                    name=t.name,
+                    server_id=srv_id,
+                    server_name=srv.name if srv else None,
+                    server_base_url=srv.base_url if srv else None,
+                    is_active=t.is_active,
+                    role="superadmin",
+                    permissions={
+                        res: TenantPermissionsMap(canRead=True, canWrite=True, canDelete=True)
+                        for res in resources
+                    }
+                )
+            )
+        return result
+
+    # Non-superadmin: evaluate Casbin RBAC for current_user
+    user_id_str = str(current_user.id)
+    username_str = current_user.username or ""
+    enforcer = get_casbin_enforcer()
+
+    # Pre-fetch user policies and grouping
+    all_policies = enforcer.get_policy()
+    user_policies = [
+        p for p in all_policies
+        if len(p) >= 4 and p[0] in [user_id_str, username_str, current_user.role]
+    ]
+
+    for t in tenants:
+        t_id = str(t.id)
+        t_dom = f"tenant:{t_id}"
+        srv_id = t.get_server_id_str()
+        srv = server_map.get(srv_id) if srv_id else None
+
+        is_owner = t.user_id in [user_id_str, current_user.id]
+
+        # Domain roles
+        domain_roles = await enforcer.get_roles_for_user_in_domain(user_id_str, t_dom)
+        if not domain_roles and username_str:
+            domain_roles = await enforcer.get_roles_for_user_in_domain(username_str, t_dom)
+        global_roles = await enforcer.get_roles_for_user_in_domain(user_id_str, "*")
+
+        assigned_role: Optional[str] = None
+        if domain_roles:
+            assigned_role = domain_roles[0]
+        elif global_roles:
+            assigned_role = global_roles[0]
+
+        perms_map: dict = {}
+        has_any_perm = is_owner
+
+        for res in resources:
+            can_read = is_owner or enforcer.enforce(user_id_str, t_dom, res, "read")
+            can_write = is_owner or enforcer.enforce(user_id_str, t_dom, res, "write")
+            can_delete = is_owner or enforcer.enforce(user_id_str, t_dom, res, "delete")
+
+            if not can_read and username_str:
+                can_read = enforcer.enforce(username_str, t_dom, res, "read")
+            if not can_write and username_str:
+                can_write = enforcer.enforce(username_str, t_dom, res, "write")
+            if not can_delete and username_str:
+                can_delete = enforcer.enforce(username_str, t_dom, res, "delete")
+
+            # Fallback direct inspection if wildcard or role match
+            if not (can_read and can_write and can_delete):
+                for p in user_policies:
+                    p_dom = p[1]
+                    p_obj = p[2]
+                    p_act = p[3]
+                    if p_dom in ["*", t_dom, t_id] and p_obj in ["*", res]:
+                        if p_act in ["*", "read"]:
+                            can_read = True
+                        if p_act in ["*", "write"]:
+                            can_write = True
+                        if p_act in ["*", "delete"]:
+                            can_delete = True
+
+            if can_read or can_write or can_delete:
+                has_any_perm = True
+
+            perms_map[res] = TenantPermissionsMap(
+                canRead=can_read,
+                canWrite=can_write,
+                canDelete=can_delete
+            )
+
+        if has_any_perm:
+            result.append(
+                UserTenantAccessResponse(
+                    id=t_id,
+                    name=t.name,
+                    server_id=srv_id,
+                    server_name=srv.name if srv else None,
+                    server_base_url=srv.base_url if srv else None,
+                    is_active=t.is_active,
+                    role=assigned_role or ("owner" if is_owner else "custom"),
+                    permissions=perms_map
+                )
+            )
+
+    return result
 
 
 @router.post("/token")

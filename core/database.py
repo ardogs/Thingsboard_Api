@@ -51,24 +51,51 @@ async def init_db(custom_client: Optional[AsyncIOMotorClient] = None, database_n
                 _mongo_client.close()
             except Exception:
                 pass
-        logger.info(f"[MongoDB] Conectando a {settings.MONGO_URI} (Base de datos: {db_name})...")
-        _mongo_client = AsyncIOMotorClient(settings.MONGO_URI)
+        logger.info(f"[MongoDB] Conectando a {settings.MONGO_URI} (Base de datos: {db_name}, tz_aware=True)...")
+        _mongo_client = AsyncIOMotorClient(settings.MONGO_URI, tz_aware=True)
 
     database = _mongo_client[db_name]
 
-    await init_beanie(
-        database=database,
-        document_models=[
-            User,
-            TBServer,
-            TBTenant,
-            TBNode,
-            TBBackup,
-            AuditLog,
-            TBScheduledTask,
-            TBEmailConfig
-        ]
-    )
+    # Reconciliación defensiva de índices previos para evitar IndexKeySpecsConflict
+    try:
+        email_col = database["tb_email_configs"]
+        idx_info = await email_col.index_information()
+        if "singleton_key_1" in idx_info and not idx_info["singleton_key_1"].get("unique", False):
+            logger.info("[MongoDB] Reconciliando índice 'singleton_key_1' en tb_email_configs (recreando como único)...")
+            await email_col.drop_index("singleton_key_1")
+    except Exception as e:
+        logger.debug(f"[MongoDB] Reconciliación defensiva de índices: {e}")
+
+    # Inicialización de Beanie con reintentos para mitigar condiciones de carrera en arranque concurrente
+    max_init_retries = 3
+    for attempt in range(1, max_init_retries + 1):
+        try:
+            await init_beanie(
+                database=database,
+                document_models=[
+                    User,
+                    TBServer,
+                    TBTenant,
+                    TBNode,
+                    TBBackup,
+                    AuditLog,
+                    TBScheduledTask,
+                    TBEmailConfig
+                ],
+                allow_index_dropping=True
+            )
+            break
+        except Exception as e:
+            if attempt < max_init_retries and ("Index" in str(e) or "code 86" in str(e) or "IndexKeySpecsConflict" in str(e)):
+                logger.warning(f"[MongoDB] Reintentando inicialización de Beanie (intento {attempt}/{max_init_retries}) tras conflicto de índice: {e}")
+                try:
+                    await database["tb_email_configs"].drop_index("singleton_key_1")
+                except Exception:
+                    pass
+                await asyncio.sleep(attempt * 0.5)
+            else:
+                raise
+
     logger.info("[MongoDB] Beanie ODM inicializado exitosamente con los modelos User, TBServer, TBTenant, TBNode, TBBackup, AuditLog, TBScheduledTask y TBEmailConfig.")
 
 

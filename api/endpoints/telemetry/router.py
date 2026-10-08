@@ -5,9 +5,9 @@ import calendar
 import mimetypes
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Union, Any
+from typing import Optional, List, Union, Any, Dict
 
-from fastapi import APIRouter, HTTPException, Request, Depends, status
+from fastapi import APIRouter, HTTPException, Request, Depends, status, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 import redis.asyncio as redis
@@ -15,17 +15,18 @@ from beanie import PydanticObjectId
 
 from core.models.tb_tenant import TBTenant
 from core.models.tb_backup import TBBackup
+from core.pagination import PaginatedResponse, build_pagination_metadata
+from core.services.task_registry import publish_task_event
 from core.config import settings
 from core.logger import logger
 from core.redis_client import redis_client
 from core.arq_pool import get_arq_pool
 from core.casbin_enforcer import get_casbin_enforcer
+from core.services.telegram_service import format_alert_message
 from api.deps import User, get_current_user
 from workers.tasks import (
     download_telemetry_task,
     generate_monthly_heatmap_task,
-    get_user_stream_channel,
-    get_user_registry_key,
     get_server_lock_key
 )
 
@@ -148,6 +149,19 @@ class ExcelReportRequest(BaseModel):
         return self
 
 
+class HeatmapEmailOptions(BaseModel):
+    """Opciones avanzadas para el envío de reportes mensuales de mapas de calor por correo electrónico."""
+    enabled: bool = Field(default=False, description="Bandera que indica si el envío de correo está activo y debe ser procesado")
+    to_email: Optional[Union[str, List[str]]] = Field(default=None, description="Para (destinatario o lista de destinatarios)")
+    subject: Optional[str] = Field(default=None, description="Asunto del correo")
+    cc: Optional[Union[str, List[str]]] = Field(default=None, description="Con copia (CC)")
+    bcc: Optional[Union[str, List[str]]] = Field(default=None, description="Con copia oculta (BCC)")
+    body: Optional[str] = Field(default=None, description="Cuerpo del mensaje (texto plano o HTML)")
+    from_email: Optional[str] = Field(default=None, description="De* (opcional para sobreescribir el remitente de la configuración SMTP cargada)")
+    from_name: Optional[str] = Field(default=None, description="Nombre descriptivo del remitente (From Name)")
+    sender_name: Optional[str] = Field(default=None, description="Alias para from_name (Nombre descriptivo del remitente)")
+
+
 class HeatmapReportRequest(BaseModel):
     tenant_id: str = Field(..., description="ID de MongoDB del documento TBTenant")
     year: Optional[int] = Field(default=None, description="Año numérico (ej: 2026)")
@@ -155,17 +169,23 @@ class HeatmapReportRequest(BaseModel):
     time_zone: Optional[str] = Field(default=None, description="Zona horaria (default: settings.APP_TIMEZONE)")
     heatmap_config: Optional[dict] = Field(default=None, description="Configuración personalizada de heatmap (whitelist, reglas, agregación)")
 
+    # Opciones de envío por correo electrónico
+    send_email: bool = Field(default=False, description="Bandera que indica si el envío por correo electrónico está activo y debe ser procesado")
+    email_options: Optional[HeatmapEmailOptions] = Field(default=None, description="Opciones avanzadas de correo electrónico")
 
-class ActiveTaskResponse(BaseModel):
-    task_id: str
-    user_id: Optional[str] = None
-    status: str
-    tenant_name: str
-    current_device: Optional[str] = None
-    current_key: Optional[str] = None
-    progress_pct: float = 0.0
-    total_records: int = 0
-    records_count: Optional[int] = None
+    # Atajos directos para máxima comodidad del usuario:
+    to_email: Optional[Union[str, List[str]]] = Field(default=None, description="Para (destinatario)")
+    subject: Optional[str] = Field(default=None, description="Asunto del correo")
+    email_subject: Optional[str] = Field(default=None, description="Alias para Asunto")
+    cc: Optional[Union[str, List[str]]] = Field(default=None, description="Con copia (CC)")
+    email_cc: Optional[Union[str, List[str]]] = Field(default=None, description="Alias para Con copia (CC)")
+    bcc: Optional[Union[str, List[str]]] = Field(default=None, description="Con copia oculta (BCC)")
+    email_bcc: Optional[Union[str, List[str]]] = Field(default=None, description="Alias para Con copia oculta (BCC)")
+    body: Optional[str] = Field(default=None, description="Cuerpo del correo (texto plano o HTML)")
+    email_body: Optional[str] = Field(default=None, description="Alias para Cuerpo del correo")
+    from_email: Optional[str] = Field(default=None, description="De* (opcional para sobreescribir el remitente de la configuración SMTP cargada)")
+    from_name: Optional[str] = Field(default=None, description="Nombre descriptivo del remitente (From Name)")
+    sender_name: Optional[str] = Field(default=None, description="Alias para from_name (Nombre descriptivo del remitente)")
 
 
 class BackupResponse(BaseModel):
@@ -174,12 +194,69 @@ class BackupResponse(BaseModel):
     tenant_name: Optional[str] = Field(default=None, description="Nombre del Tenant")
     task_id: str = Field(..., description="ID del trabajo/tarea de respaldo en ARQ")
     requested_by: str = Field(..., description="ID del usuario que solicitó el respaldo")
-    file_name: str = Field(..., description="Nombre del archivo ZIP generado")
+    file_name: str = Field(..., description="Nombre del archivo generado")
+    backup_type: str = Field(default="telemetry", description="Tipo de respaldo o artefacto")
     start_date: datetime = Field(..., description="Fecha de inicio del rango de telemetría")
     end_date: datetime = Field(..., description="Fecha de fin del rango de telemetría")
-    file_size_bytes: int = Field(default=0, description="Tamaño del archivo ZIP en bytes")
+    file_size_bytes: int = Field(default=0, description="Tamaño del archivo en bytes")
     created_at: datetime = Field(..., description="Fecha y hora de creación del respaldo")
-    download_url: str = Field(..., description="URL para la descarga directa del archivo ZIP")
+    download_url: str = Field(..., description="URL para la descarga directa del archivo")
+
+
+class PaginatedBackupResponse(PaginatedResponse[BackupResponse]):
+    """Respuesta paginada estándar para el catálogo de respaldos y artefactos."""
+    pass
+
+
+class DeviceStatusWebhookRequest(BaseModel):
+    """
+    DTO para la recepción de eventos y alertas de estado de dispositivos emitidos
+    desde el Rule Engine de ThingsBoard o servicios de monitoreo perimetral.
+    """
+    device_name: str = Field(..., min_length=1, description="Nombre del dispositivo en ThingsBoard")
+    status: str = Field(..., min_length=1, description="Estado reportado (ej: ONLINE, OFFLINE, CRITICAL, WARNING, ERROR)")
+    layer: Union[int, str] = Field(..., description="Capa de monitoreo (1, 2, 3, 4 o identificador de capa)")
+    tenant_id: str = Field(..., min_length=1, description="ID del tenant asociado en ThingsBoard o MongoDB")
+    details: Optional[Dict[str, Any]] = Field(default=None, description="Detalles adicionales o metadatos del estado")
+    message: Optional[str] = Field(default=None, description="Mensaje descriptivo opcional del evento")
+
+    @field_validator("device_name", "status", "tenant_id", mode="before")
+    @classmethod
+    def strip_and_validate_non_empty(cls, v: Any) -> str:
+        if v is None:
+            raise ValueError("El valor no puede ser nulo.")
+        if isinstance(v, bool) or not isinstance(v, str):
+            raise ValueError("El valor debe ser una cadena de texto (string).")
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("El valor no puede estar vacío ni contener únicamente espacios en blanco.")
+        return cleaned
+
+    @field_validator("layer", mode="before")
+    @classmethod
+    def validate_layer(cls, v: Any) -> Union[int, str]:
+        if v is None:
+            raise ValueError("La capa de monitoreo no puede ser nula.")
+        if isinstance(v, bool):
+            raise ValueError("La capa de monitoreo no puede ser un booleano.")
+        if not isinstance(v, (int, str)):
+            raise ValueError("La capa de monitoreo debe ser un entero o una cadena de texto.")
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if not cleaned:
+                raise ValueError("La capa de monitoreo no puede estar vacía ni contener únicamente espacios en blanco.")
+            return cleaned
+        return v
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def strip_message(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, str):
+            raise ValueError("El mensaje descriptivo debe ser una cadena de texto (string).")
+        cleaned = v.strip()
+        return cleaned if cleaned else None
 
 
 @router.post("/download", status_code=status.HTTP_200_OK)
@@ -270,8 +347,21 @@ async def download_telemetry(
         await redis_client.delete(lock_key)
         raise e
 
+    # Publicar evento inicial en Redis (SSE / Registro Hash de tareas activas)
+    await publish_task_event(
+        redis_client=redis_client,
+        user_id=str(current_user.id),
+        task_id=job_id,
+        status="QUEUED",
+        task_type="telemetry",
+        progress_pct=0.0,
+        message="Tarea de descarga de telemetría encolada en ARQ.",
+        tenant_name=tenant_doc.name
+    )
+
     return {
         "task_id": job_id,
+        "task_type": "telemetry",
         "status": "Task enqueued",
         "user_id": str(current_user.id),
         "tenant_id": str(tenant_doc.id),
@@ -374,8 +464,21 @@ async def generate_excel_report(
         await redis_client.delete(lock_key)
         raise e
 
+    # Publicar evento inicial en Redis (SSE / Registro Hash de tareas activas)
+    await publish_task_event(
+        redis_client=redis_client,
+        user_id=str(current_user.id),
+        task_id=job_id,
+        status="QUEUED",
+        task_type="excel_report",
+        progress_pct=0.0,
+        message="Tarea de generación de reporte Excel encolada en ARQ.",
+        tenant_name=tenant_doc.name
+    )
+
     return {
         "task_id": job_id,
+        "task_type": "excel_report",
         "status": "Task enqueued",
         "user_id": str(current_user.id),
         "tenant_id": str(tenant_doc.id),
@@ -451,7 +554,55 @@ async def generate_heatmap_report_endpoint(
             detail="El servidor ThingsBoard se encuentra actualmente ocupado procesando otra tarea. Por favor, intente más tarde."
         )
 
-    # 5. Preparar payload para ARQ
+    # 5. Resolver y validar opciones de envío de correo electrónico
+    send_email_active = bool(
+        request.send_email
+        or (request.email_options and request.email_options.enabled)
+    )
+
+    resolved_to_email = (
+        request.to_email
+        or (request.email_options.to_email if request.email_options else None)
+    )
+    resolved_subject = (
+        request.subject
+        or request.email_subject
+        or (request.email_options.subject if request.email_options else None)
+    )
+    resolved_cc = (
+        request.cc
+        or request.email_cc
+        or (request.email_options.cc if request.email_options else None)
+    )
+    resolved_bcc = (
+        request.bcc
+        or request.email_bcc
+        or (request.email_options.bcc if request.email_options else None)
+    )
+    resolved_body = (
+        request.body
+        or request.email_body
+        or (request.email_options.body if request.email_options else None)
+    )
+    resolved_from = (
+        request.from_email
+        or (request.email_options.from_email if request.email_options else None)
+    )
+    resolved_from_name = (
+        request.from_name
+        or request.sender_name
+        or (request.email_options.from_name if request.email_options else None)
+        or (request.email_options.sender_name if request.email_options else None)
+    )
+
+    if send_email_active and not resolved_to_email:
+        await redis_client.delete(lock_key)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="El campo 'to_email' (destinatario) es obligatorio cuando el envío por correo electrónico está activo (send_email=True)."
+        )
+
+    # 6. Preparar payload para ARQ
     task_payload = {
         "tenant_id": str(tenant_doc.id),
         "tenant_name": tenant_doc.name,
@@ -461,7 +612,17 @@ async def generate_heatmap_report_endpoint(
         "month": request.month,
         "time_zone": request.time_zone or settings.APP_TIMEZONE,
         "heatmap_config": request.heatmap_config,
-        "user_id": str(current_user.id)
+        "user_id": str(current_user.id),
+        "send_email": send_email_active,
+        "to_email": resolved_to_email,
+        "subject": resolved_subject,
+        "cc": resolved_cc,
+        "bcc": resolved_bcc,
+        "body": resolved_body,
+        "from_email": resolved_from,
+        "from_name": resolved_from_name,
+        "sender_name": resolved_from_name,
+        "email_options": request.email_options.model_dump() if request.email_options else None
     }
 
     # 6. Encolar la tarea en ARQ
@@ -477,8 +638,21 @@ async def generate_heatmap_report_endpoint(
         await redis_client.delete(lock_key)
         raise e
 
+    # Publicar evento inicial en Redis (SSE / Registro Hash de tareas activas)
+    await publish_task_event(
+        redis_client=redis_client,
+        user_id=str(current_user.id),
+        task_id=job_id,
+        status="QUEUED",
+        task_type="heatmap",
+        progress_pct=0.0,
+        message="Tarea de generación de mapa de calor encolada en ARQ.",
+        tenant_name=tenant_doc.name
+    )
+
     return {
         "task_id": job_id,
+        "task_type": "heatmap",
         "status": "Task enqueued",
         "user_id": str(current_user.id),
         "tenant_id": str(tenant_doc.id),
@@ -488,166 +662,207 @@ async def generate_heatmap_report_endpoint(
     }
 
 
-@router.get("/tasks/active", response_model=List[ActiveTaskResponse])
-async def get_active_tasks(current_user: User = Depends(get_current_user)):
-    """
-    Retorna la lista de tareas en ejecución actualmente pertenecientes al usuario autenticado.
-    """
-    user_registry_key = get_user_registry_key(str(current_user.id))
-    raw_tasks = await redis_client.hgetall(user_registry_key)
-    active_tasks: List[ActiveTaskResponse] = []
-
-    for task_id, payload_str in raw_tasks.items():
-        try:
-            task_data = json.loads(payload_str)
-            active_tasks.append(ActiveTaskResponse(**task_data))
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"[Active Tasks] Error al parsear estado de tarea {task_id}: {e}")
-
-    return active_tasks
 
 
-@router.get("/stream/{task_id}")
-async def stream_task_progress(
-    task_id: str,
-    request: Request,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Endpoint Server-Sent Events (SSE) para transmitir el progreso de una tarea en tiempo real.
-    """
-    user_id = str(current_user.id)
-
-    async def event_generator():
-        pubsub = redis_client.pubsub()
-        channel = get_user_stream_channel(user_id, task_id)
-        registry_key = get_user_registry_key(user_id)
-
-        try:
-            await pubsub.subscribe(channel)
-
-            # 1. Enviar estado inicial si está registrado en el Hash del usuario
-            initial_state = await redis_client.hget(registry_key, task_id)
-            if initial_state:
-                yield f"data: {initial_state}\n\n"
-                try:
-                    parsed_initial = json.loads(initial_state)
-                    if parsed_initial.get("status") in ("SUCCESS", "ERROR", "FAILURE"):
-                        return
-                except json.JSONDecodeError:
-                    pass
-
-            last_ping_time = asyncio.get_running_loop().time()
-
-            while True:
-                if await request.is_disconnected():
-                    logger.info(f"[SSE] Cliente desconectado del stream para task_id {task_id} (user {user_id})")
-                    break
-
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                current_time = asyncio.get_running_loop().time()
-
-                if message and message.get("type") == "message":
-                    data_str = message.get("data")
-                    yield f"data: {data_str}\n\n"
-                    last_ping_time = current_time
-
-                    try:
-                        event_data = json.loads(data_str)
-                        if event_data.get("status") in ("SUCCESS", "ERROR", "FAILURE"):
-                            logger.info(f"[SSE] Tarea {task_id} finalizada ({event_data.get('status')}). Cerrando stream.")
-                            break
-                    except json.JSONDecodeError:
-                        pass
-                else:
-                    if current_time - last_ping_time >= 15.0:
-                        yield ": ping\n\n"
-                        last_ping_time = current_time
-
-                await asyncio.sleep(0.1)
-
-        except asyncio.CancelledError:
-            logger.info(f"[SSE] Petición cancelada por el cliente para task_id {task_id} (user {user_id})")
-        except Exception as e:
-            logger.error(f"[SSE] Error en el stream para task_id {task_id} (user {user_id}): {e}")
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-        finally:
-            try:
-                await pubsub.unsubscribe(channel)
-                await pubsub.aclose()
-            except Exception as e:
-                logger.warning(f"[SSE] Error cerrando recursos de Redis para task_id {task_id}: {e}")
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Content-Type": "text/event-stream",
-            "X-Accel-Buffering": "no",
+def build_single_backup_type_filter(backup_type: str) -> dict:
+    b_type = backup_type.strip().lower()
+    null_or_missing = [
+        {"backup_type": None},
+        {"backup_type": {"$exists": False}},
+        {"backup_type": ""}
+    ]
+    if b_type == "heatmap":
+        return {
+            "$or": [
+                {"backup_type": "heatmap"},
+                {
+                    "$and": [
+                        {"$or": null_or_missing},
+                        {"file_name": {"$regex": r"\.pdf$", "$options": "i"}}
+                    ]
+                }
+            ]
         }
-    )
+    elif b_type == "excel_report":
+        return {
+            "$or": [
+                {"backup_type": "excel_report"},
+                {
+                    "$and": [
+                        {"$or": null_or_missing},
+                        {"file_name": {"$regex": r"\.xlsx$", "$options": "i"}}
+                    ]
+                }
+            ]
+        }
+    elif b_type == "telemetry":
+        return {
+            "$or": [
+                {"backup_type": "telemetry"},
+                {
+                    "$and": [
+                        {"$or": null_or_missing},
+                        {"file_name": {"$not": {"$regex": r"\.(pdf|xlsx)$", "$options": "i"}}}
+                    ]
+                }
+            ]
+        }
+    else:
+        return {"backup_type": b_type}
 
 
-@router.get("/backups", response_model=List[BackupResponse], status_code=status.HTTP_200_OK)
+def build_backup_type_filter(backup_type: str) -> dict:
+    """
+    Construye el filtro de MongoDB para backup_type con soporte hacia atrás y tipos múltiples:
+    Acepta tipos individuales ('telemetry', 'excel_report', 'heatmap') o combinados separados
+    por coma ('telemetry,excel_report').
+    """
+    types = [t.strip() for t in backup_type.split(",") if t.strip()]
+    if not types:
+        return {}
+    if len(types) == 1:
+        return build_single_backup_type_filter(types[0])
+    return {"$or": [build_single_backup_type_filter(t) for t in types]}
+
+
+@router.get("/backups", response_model=PaginatedBackupResponse, status_code=status.HTTP_200_OK)
 async def list_tenant_backups(
-    tenant_id: str,
+    page: int = Query(default=1, ge=1, description="Número de página (1-indexed)"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Cantidad de registros por página"),
+    tenant_id: Optional[str] = Query(default=None, description="Filtrar respaldos por ID de tenant ('all' o None para todos los autorizados)"),
+    backup_type: Optional[str] = Query(default=None, description="Filtrar por tipo de respaldo (telemetry, excel_report, heatmap)"),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Lista el historial de respaldos de telemetría disponibles en MongoDB para un Tenant específico.
-    Permite el acceso a administradores o usuarios con permisos sobre dicho Tenant.
+    Lista el historial de respaldos de telemetría y artefactos disponibles en MongoDB con paginación y filtrado.
+    Soporta filtros por tenant_id y backup_type (telemetry, excel_report, heatmap).
+    Preserva las reglas de control de acceso RBAC con Casbin y propiedad del Tenant.
     """
-    # 1. Validar existencia del Tenant
-    try:
-        obj_id = PydanticObjectId(tenant_id)
-        tenant_doc = await TBTenant.get(obj_id)
-    except Exception:
-        tenant_doc = await TBTenant.get(tenant_id)
-
-    if not tenant_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tenant de ThingsBoard con ID '{tenant_id}' no encontrado en MongoDB"
-        )
-
-    # 2. Validar permisos de acceso al Tenant (Casbin RBAC + Ownership + Superadmin)
     is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
-    is_owner = tenant_doc.user_id in [str(current_user.id), current_user.id]
-    if not is_admin and not is_owner:
-        try:
-            enforcer = get_casbin_enforcer()
-            user_id_str = str(current_user.id)
-            tenant_domain = f"tenant:{tenant_doc.id}"
-            is_allowed = enforcer.enforce(user_id_str, tenant_domain, "telemetry", "read")
-            if not is_allowed and current_user.username:
-                is_allowed = enforcer.enforce(current_user.username, tenant_domain, "telemetry", "read")
-        except Exception:
-            is_allowed = False
 
-        if not is_allowed:
+    # Caso A: Se especifica tenant_id (distinto de 'all')
+    if tenant_id and tenant_id.lower() != "all":
+        try:
+            obj_id = PydanticObjectId(tenant_id)
+            tenant_doc = await TBTenant.get(obj_id)
+        except Exception:
+            tenant_doc = await TBTenant.get(tenant_id)
+
+        if not tenant_doc:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="No tienes permisos para consultar los respaldos de este Tenant"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Tenant de ThingsBoard con ID '{tenant_id}' no encontrado en MongoDB"
             )
 
-    # 3. Consultar documentos TBBackup asociados al Tenant
-    ref = tenant_doc.to_ref()
-    backups = await TBBackup.find(
-        {"$or": [{"tenant_id": ref}, {"tenant_id.$id": tenant_doc.id}, {"tenant_id": tenant_doc.id}]}
-    ).sort("-created_at").to_list()
+        is_owner = tenant_doc.user_id in [str(current_user.id), current_user.id]
+        if not is_admin and not is_owner:
+            try:
+                enforcer = get_casbin_enforcer()
+                user_id_str = str(current_user.id)
+                tenant_domain = f"tenant:{tenant_doc.id}"
+                is_allowed = enforcer.enforce(user_id_str, tenant_domain, "telemetry", "read")
+                if not is_allowed and current_user.username:
+                    is_allowed = enforcer.enforce(current_user.username, tenant_domain, "telemetry", "read")
+            except Exception:
+                is_allowed = False
 
-    results: List[BackupResponse] = []
+            if not is_allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No tienes permisos para consultar los respaldos de este Tenant"
+                )
+
+        ref = tenant_doc.to_ref()
+        tenant_query = {"$or": [{"tenant_id": ref}, {"tenant_id.$id": tenant_doc.id}, {"tenant_id": tenant_doc.id}]}
+
+        if backup_type:
+            mongo_filter = {"$and": [tenant_query, build_backup_type_filter(backup_type)]}
+        else:
+            mongo_filter = tenant_query
+
+        query = TBBackup.find(mongo_filter)
+        total = await query.count()
+        backups = await query.sort("-created_at").skip((page - 1) * page_size).limit(page_size).to_list()
+
+        results: List[BackupResponse] = []
+        for b in backups:
+            results.append(
+                BackupResponse(
+                    id=str(b.id),
+                    tenant_id=str(tenant_doc.id),
+                    tenant_name=tenant_doc.name,
+                    task_id=b.task_id,
+                    requested_by=b.requested_by,
+                    file_name=b.file_name,
+                    backup_type=b.get_backup_type(),
+                    start_date=b.start_date,
+                    end_date=b.end_date,
+                    file_size_bytes=b.file_size_bytes,
+                    created_at=b.created_at,
+                    download_url=f"/api/v1/telemetry/download/file/{b.task_id}"
+                )
+            )
+
+        return PaginatedBackupResponse(
+            items=results,
+            pagination=build_pagination_metadata(total=total, page=page, page_size=page_size)
+        )
+
+    # Caso B: tenant_id es None o 'all' -> listar respaldos autorizados
+    if is_admin:
+        if backup_type:
+            mongo_filter = build_backup_type_filter(backup_type)
+        else:
+            mongo_filter = {}
+    else:
+        # Resolver tenants permitidos para el usuario
+        enforcer = get_casbin_enforcer()
+        all_tenants = await TBTenant.find_all().to_list()
+        allowed_tenant_ids = []
+        user_id_str = str(current_user.id)
+        for t in all_tenants:
+            if t.user_id in [user_id_str, current_user.id]:
+                allowed_tenant_ids.append(t.id)
+                continue
+            t_dom = f"tenant:{t.id}"
+            if enforcer.enforce(user_id_str, t_dom, "telemetry", "read") or (
+                current_user.username and enforcer.enforce(current_user.username, t_dom, "telemetry", "read")
+            ):
+                allowed_tenant_ids.append(t.id)
+
+        if not allowed_tenant_ids:
+            return PaginatedBackupResponse(
+                items=[],
+                pagination=build_pagination_metadata(total=0, page=page, page_size=page_size)
+            )
+
+        tenant_query = {
+            "$or": [
+                {"tenant_id.$id": {"$in": allowed_tenant_ids}},
+                {"tenant_id": {"$in": allowed_tenant_ids}}
+            ]
+        }
+        if backup_type:
+            mongo_filter = {"$and": [tenant_query, build_backup_type_filter(backup_type)]}
+        else:
+            mongo_filter = tenant_query
+
+    query = TBBackup.find(mongo_filter)
+    total = await query.count()
+    backups = await query.sort("-created_at").skip((page - 1) * page_size).limit(page_size).to_list()
+
+    results = []
     for b in backups:
+        t_doc = await b.get_tenant()
         results.append(
             BackupResponse(
                 id=str(b.id),
-                tenant_id=str(tenant_doc.id),
-                tenant_name=tenant_doc.name,
+                tenant_id=b.get_tenant_id_str(),
+                tenant_name=t_doc.name if t_doc else None,
                 task_id=b.task_id,
                 requested_by=b.requested_by,
                 file_name=b.file_name,
+                backup_type=b.get_backup_type(),
                 start_date=b.start_date,
                 end_date=b.end_date,
                 file_size_bytes=b.file_size_bytes,
@@ -656,7 +871,10 @@ async def list_tenant_backups(
             )
         )
 
-    return results
+    return PaginatedBackupResponse(
+        items=results,
+        pagination=build_pagination_metadata(total=total, page=page, page_size=page_size)
+    )
 
 
 @router.get("/download/file/{task_id}")
@@ -758,114 +976,178 @@ async def download_file(
     )
 
 
-@router.get("/status/{task_id}")
-async def get_task_status(
-    task_id: str,
+@router.delete("/backups/{backup_id}", status_code=status.HTTP_200_OK)
+async def delete_tenant_backup(
+    backup_id: str,
     current_user: User = Depends(get_current_user)
 ):
     """
-    Consulta el estado de un trabajo en ARQ para usuarios autenticados.
+    Elimina permanentemente un archivo de respaldo del catálogo en MongoDB y del disco físico.
+    Requiere permisos de eliminación ('delete' o superadmin) sobre el recurso 'telemetry' para el Tenant.
     """
-    from arq.jobs import Job
-    arq_pool = await get_arq_pool()
-    job = Job(task_id, arq_pool)
+    # 1. Buscar documento TBBackup por MongoDB ID o task_id
+    backup_doc = None
     try:
-        raw_status = await job.status()
-        status_str = raw_status.value if hasattr(raw_status, "value") else str(raw_status)
+        obj_id = PydanticObjectId(backup_id)
+        backup_doc = await TBBackup.get(obj_id)
     except Exception:
-        status_str = "unknown"
+        pass
 
-    response = {
-        "task_id": task_id,
-        "status": status_str,
-    }
+    if not backup_doc:
+        try:
+            backup_doc = await TBBackup.get(backup_id)
+        except Exception:
+            pass
 
-    if status_str in ("not_found", "unknown"):
-        # Fallback de verificación en registro de usuario
-        r = redis_client
-        user_registry_key = get_user_registry_key(str(current_user.id))
-        task_json = await r.hget(user_registry_key, task_id)
-        if task_json:
-            try:
-                task_data = json.loads(task_json)
-                response["status"] = task_data.get("status", status_str)
-            except Exception:
-                pass
+    if not backup_doc:
+        backup_doc = await TBBackup.find_one({"task_id": backup_id})
 
-    return response
-
-
-@router.post("/tasks/{job_id}/cancel")
-async def cancel_telemetry_task(
-    job_id: str,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Botón de Pánico: Envía una señal de aborto/cancelación inmediata a un trabajo de ARQ en ejecución o encolado.
-    - Obtiene el pool de ARQ (get_arq_pool).
-    - Instancia el trabajo: job = Job(job_id, arq_pool).
-    - Verifica el estado actual. Si no existe (404) o ya terminó (400), devuelve el error correspondiente.
-    - Si está encolado o en progreso, ejecuta await job.abort().
-    - Notifica a los canales SSE de Redis y devuelve HTTP 200 confirmando la emisión de la señal de terminación.
-    """
-    from arq.jobs import Job, JobStatus
-
-    arq_pool = await get_arq_pool()
-    job = Job(job_id, arq_pool)
-
-    try:
-        raw_status = await job.status()
-    except Exception as e:
-        logger.error(f"[Cancel Task] Error consultando estado del trabajo {job_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error consultando el estado del trabajo en ARQ: {str(e)}"
-        )
-
-    if raw_status == JobStatus.not_found:
+    if not backup_doc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"El trabajo con ID '{job_id}' no fue encontrado en ARQ"
+            detail=f"Respaldo con ID '{backup_id}' no encontrado"
         )
 
-    if raw_status == JobStatus.complete:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"El trabajo '{job_id}' ya ha finalizado y no puede ser cancelado"
-        )
+    # 2. Validar permisos RBAC
+    is_admin = current_user.is_superuser or current_user.role in ["admin", "superadmin"]
+    if not is_admin:
+        tenant_doc = await backup_doc.get_tenant()
+        is_owner = tenant_doc and tenant_doc.user_id in [str(current_user.id), current_user.id]
+        if not is_owner:
+            tenant_id_str = f"tenant:{tenant_doc.id}" if tenant_doc else "*"
+            try:
+                enforcer = get_casbin_enforcer()
+                user_id_str = str(current_user.id)
+                is_allowed = enforcer.enforce(user_id_str, tenant_id_str, "telemetry", "delete")
+                if not is_allowed and current_user.username:
+                    is_allowed = enforcer.enforce(current_user.username, tenant_id_str, "telemetry", "delete")
+            except Exception:
+                is_allowed = False
 
-    logger.warning(
-        f"[Cancel Task] Usuario '{current_user.username}' ({current_user.id}) solicitó cancelar "
-        f"el trabajo '{job_id}' (Estado actual: {raw_status}). Enviando señal de aborto..."
+            if not is_allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No tienes permisos para eliminar este respaldo"
+                )
+
+    # 3. Eliminar archivo físico de disco si existe
+    backup_dir = "backups"
+    candidate_paths = [
+        os.path.join(backup_dir, backup_doc.file_name),
+        os.path.join(backup_dir, "heatmaps", backup_doc.file_name)
+    ]
+    for cp in candidate_paths:
+        try:
+            if os.path.exists(cp):
+                os.remove(cp)
+                logger.info(f"[Backup Delete] Archivo físico eliminado: {cp}")
+        except Exception as e:
+            logger.warning(f"[Backup Delete] Error al eliminar archivo físico {cp}: {e}")
+
+    # 4. Eliminar documento de MongoDB
+    doc_id = str(backup_doc.id)
+    await backup_doc.delete()
+    logger.info(f"[Backup Delete] Documento TBBackup '{doc_id}' eliminado por usuario '{current_user.username}'")
+
+    return {
+        "status": "DELETED",
+        "message": "Respaldo de telemetría eliminado exitosamente",
+        "id": doc_id
+    }
+
+
+@router.post(
+    "/webhooks/device-status",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Webhook para eventos de estado de dispositivos de ThingsBoard",
+    description="Recibe eventos de estado y telemetría de dispositivos enviados automáticamente por ThingsBoard Rule Engine y encola notificaciones de alerta a Telegram vía ARQ."
+)
+async def device_status_webhook(payload: DeviceStatusWebhookRequest) -> dict:
+    """
+    Webhook público (machine-to-machine) consumido por ThingsBoard Rule Engine u otros sistemas perimetrales.
+    No requiere sesión interactiva JWT de usuario.
+
+    1. Valida el esquema del payload estructurado con Pydantic v2.
+    2. Construye un mensaje formateado en HTML claro y profesional usando format_alert_message.
+    3. Encola la tarea send_telegram_alert_task de forma 100% asíncrona en ARQ.
+    4. Retorna de inmediato HTTP 202 Accepted con los metadatos correspondientes.
+    """
+    # Mapeo semántico de niveles de severidad para iconos visuales en Telegram
+    status_level_map = {
+        "CRITICAL": "CRITICAL",
+        "ERROR": "ERROR",
+        "FAIL": "ERROR",
+        "FAILED": "ERROR",
+        "WARNING": "WARNING",
+        "WARN": "WARNING",
+        "OFFLINE": "WARNING",
+        "ONLINE": "SUCCESS",
+        "SUCCESS": "SUCCESS",
+        "OK": "SUCCESS",
+        "INFO": "INFO",
+    }
+    severity_level = status_level_map.get(payload.status.upper(), "INFO")
+
+    title = f"Evento de Dispositivo: {payload.device_name}"
+    body = payload.message or f"El dispositivo '{payload.device_name}' reportó el estado '{payload.status}' en la Capa {payload.layer}."
+    tags = ["ThingsBoard", "DeviceStatus", f"Capa{payload.layer}", payload.status.upper()]
+
+    alert_details: Dict[str, Any] = {
+        "Dispositivo": payload.device_name,
+        "Estado": payload.status,
+        "Capa": str(payload.layer),
+        "Tenant ID": payload.tenant_id,
+    }
+    if payload.details:
+        for k, v in payload.details.items():
+            alert_details[str(k)] = v
+
+    formatted_message = format_alert_message(
+        title=title,
+        body=body,
+        level=severity_level,
+        tags=tags,
+        details=alert_details,
     )
 
-    # Enviar señal de cancelación a ARQ
-    aborted = await job.abort(timeout=5.0)
+    alert_key = f"device_status:{payload.tenant_id}:{payload.device_name}:{payload.status}"
 
-    # Publicar estado CANCELLED en Redis Pub/Sub y purgar del registro activo
-    r = redis_client
-    user_id_str = str(current_user.id)
-    stream_channel = get_user_stream_channel(user_id_str, job_id)
-    user_registry_key = get_user_registry_key(user_id_str)
-
-    cancel_event = {
-        "task_id": job_id,
-        "status": "CANCELLED",
-        "progress_pct": 0.0,
-        "message": "Tarea cancelada exitosamente a petición del usuario.",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
     try:
-        await r.publish(stream_channel, json.dumps(cancel_event))
-        await r.hdel(user_registry_key, job_id)
-    except Exception as pub_err:
-        logger.warning(f"[Cancel Task] Advertencia notificando cancelación en Redis: {pub_err}")
+        arq_pool = await get_arq_pool()
+        job = await arq_pool.enqueue_job(
+            "send_telegram_alert_task",
+            payload={
+                "message": formatted_message,
+                "alert_key": alert_key,
+                "ttl_seconds": 300,
+                "layer": payload.layer,
+                "device_name": payload.device_name,
+                "status": payload.status,
+                "tenant_id": payload.tenant_id,
+                "details": payload.details,
+            }
+        )
+    except Exception as arq_err:
+        logger.error(f"[Webhook] Error al encolar tarea en ARQ/Redis: {arq_err}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Servicio de encolamiento temporalmente no disponible: {arq_err}",
+        )
 
-    prev_status_str = raw_status.value if hasattr(raw_status, "value") else str(raw_status)
+    job_id = job.job_id if job else None
+    logger.info(
+        f"[Webhook] Evento de estado encolado en ARQ (Job: {job_id}) para dispositivo '{payload.device_name}' "
+        f"[Estado: {payload.status}, Capa: {payload.layer}, Tenant: {payload.tenant_id}]"
+    )
+
     return {
-        "status": "cancelled",
+        "status": "accepted",
         "job_id": job_id,
-        "aborted": aborted,
-        "previous_status": prev_status_str,
-        "message": f"Señal de terminación enviada exitosamente para la tarea '{job_id}'."
+        "device_name": payload.device_name,
+        "device_status": payload.status,
+        "layer": str(payload.layer),
+        "tenant_id": payload.tenant_id,
     }
+
+
+

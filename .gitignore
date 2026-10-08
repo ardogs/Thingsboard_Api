@@ -15,4 +15,4 @@ tenant_backups/*
 graphify-out/*
 docs/*
 AGENTS.md
-GEMINI.md
+_workspace/

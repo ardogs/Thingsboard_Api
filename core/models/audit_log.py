@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from beanie import Document
-from pydantic import Field
+from pydantic import Field, field_validator
 
 
 class AuditLog(Document):
@@ -10,6 +10,14 @@ class AuditLog(Document):
     Almacena métodos mutantes (POST, PUT, DELETE, PATCH) con payloads sanitizados para proteger credenciales.
     """
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Marca de tiempo UTC del evento")
+
+    @field_validator("timestamp", mode="after")
+    @classmethod
+    def ensure_tz_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """Asegura que todas las marcas de tiempo sean offset-aware en UTC puro."""
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
     user_id: Optional[str] = Field(default=None, description="ID del usuario autenticado en la plataforma (o None si es anónimo/login)")
     ip_address: str = Field(default="127.0.0.1", description="Dirección IP de origen del cliente")
     method: str = Field(..., description="Método HTTP ejecutado (POST, PUT, DELETE, etc.)")

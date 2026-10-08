@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
@@ -10,7 +11,7 @@ from core.models.tb_tenant import TBTenant
 from core.tb_client import ThingsBoardClient
 from core.casbin_enforcer import get_casbin_enforcer
 from core.logger import logger
-from api.deps import User, get_current_user
+from api.deps import User, get_current_user, CasbinAuth
 
 router = APIRouter()
 
@@ -76,6 +77,19 @@ class SiteWithDevicesResponse(BaseModel):
     devices: List[DeviceSummary] = Field(default_factory=list)
 
 
+class DeviceRelationRequest(BaseModel):
+    relation_type: Optional[str] = Field(default=None, min_length=1, description="Tipo de relación física/edge personalizada (ej: Edge_Link)")
+
+
+class DeviceRelationResponse(BaseModel):
+    status: str = Field(..., description="Estado de la operación: success")
+    tenant_id: str = Field(..., description="ID del Tenant")
+    parent_id: str = Field(..., description="ID del dispositivo padre (Edge / Gateway)")
+    child_id: str = Field(..., description="ID del dispositivo hijo (Sensor / Subdispositivo)")
+    relation_type: str = Field(..., description="Tipo de relación física/edge")
+    message: str = Field(..., description="Descripción del resultado de la operación")
+
+
 # ==========================================
 # Resolución Inversa y Autenticación Resiliente
 # ==========================================
@@ -109,9 +123,18 @@ async def _resolve_tenant_and_server(
         try:
             enforcer = get_casbin_enforcer()
             tenant_domain = f"tenant:{tenant.id}"
-            is_allowed = enforcer.enforce(str(current_user.id), tenant_domain, "devices", "read")
+            user_id_str = str(current_user.id)
+            is_allowed = (
+                enforcer.enforce(user_id_str, tenant_domain, "devices", "read")
+                or enforcer.enforce(user_id_str, tenant_domain, "telemetry", "read")
+                or enforcer.enforce(user_id_str, tenant_domain, "telemetry", "write")
+            )
             if not is_allowed and current_user.username:
-                is_allowed = enforcer.enforce(current_user.username, tenant_domain, "devices", "read")
+                is_allowed = (
+                    enforcer.enforce(current_user.username, tenant_domain, "devices", "read")
+                    or enforcer.enforce(current_user.username, tenant_domain, "telemetry", "read")
+                    or enforcer.enforce(current_user.username, tenant_domain, "telemetry", "write")
+                )
         except Exception:
             is_allowed = False
 
@@ -337,23 +360,110 @@ async def list_sites_with_devices(
             detail=f"Error consultando sitios en ThingsBoard: {str(e)}"
         )
 
-    sites_map: Dict[str, SiteWithDevicesResponse] = {}
+    if not data_items:
+        return []
 
-    for item in data_items:
-        # 1. Extracción robusta de ID (soporta entityId, id, dict o string)
-        entity_id_info = item.get("entityId") or item.get("id") or {}
+    # Precargar dispositivos del Tenant para resolución rápida y enriquecimiento (name, type, label, additional_info)
+    devices_lookup: Dict[str, dict] = {}
+    try:
+        try:
+            devices_res = await client.get_tenant_devices(token=token, limit=1000)
+        except httpx.HTTPStatusError as dev_http_err:
+            if dev_http_err.response.status_code == 401:
+                logger.warning(f"[Sites] HTTP 401 al precargar dispositivos de Tenant '{tenant.name}'. Re-autenticando...")
+                token = await _reauthenticate_tenant(tenant, client)
+                devices_res = await client.get_tenant_devices(token=token, limit=1000)
+            else:
+                raise dev_http_err
+
+        if isinstance(devices_res, dict):
+            for dev in devices_res.get("data", []):
+                d_id_info = dev.get("id") or dev.get("entityId") or {}
+                if isinstance(d_id_info, dict):
+                    d_id = d_id_info.get("id") or d_id_info.get("entityId")
+                elif isinstance(d_id_info, str):
+                    d_id = d_id_info
+                else:
+                    d_id = None
+                if d_id:
+                    devices_lookup[str(d_id)] = dev
+    except Exception as dev_err:
+        logger.warning(f"[Sites] No se pudieron cargar los dispositivos del tenant para enriquecimiento ({dev_err}). Se continuará con datos de relaciones.")
+
+    sem = asyncio.Semaphore(10)
+    auth_lock = asyncio.Lock()
+
+    def _clean_additional_info(info: Any) -> Optional[Dict[str, Any]]:
+        return info if isinstance(info, dict) else None
+
+    async def _safe_get_relations(
+        http_client: httpx.AsyncClient,
+        from_id: Optional[str] = None,
+        from_type: Optional[str] = "ASSET",
+        to_id: Optional[str] = None,
+        to_type: Optional[str] = None
+    ) -> list[dict]:
+        nonlocal token
+        try:
+            return await client.get_entity_relations(
+                from_id=from_id,
+                from_type=from_type,
+                to_id=to_id,
+                to_type=to_type,
+                token=token,
+                client=http_client
+            )
+        except httpx.HTTPStatusError as http_err:
+            if http_err.response.status_code == 401:
+                failed_token = token
+                async with auth_lock:
+                    if token == failed_token:
+                        logger.warning(f"[Sites] HTTP 401 al consultar relaciones en Tenant '{tenant.name}'. Renovando token...")
+                        token = await _reauthenticate_tenant(tenant, client)
+                try:
+                    return await client.get_entity_relations(
+                        from_id=from_id,
+                        from_type=from_type,
+                        to_id=to_id,
+                        to_type=to_type,
+                        token=token,
+                        client=http_client
+                    )
+                except httpx.HTTPStatusError as retry_http_err:
+                    if retry_http_err.response.status_code == 401:
+                        logger.error(f"[Sites] Fallo 401 persistente contra ThingsBoard tras re-autenticar para Tenant '{tenant.name}'")
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail="Fallo de autenticación persistente contra ThingsBoard tras re-autenticar"
+                        )
+                    return []
+                except HTTPException:
+                    raise
+                except Exception as retry_exc:
+                    logger.warning(f"[Sites] Error en retry de relaciones ({retry_exc})")
+                    return []
+            return []
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning(f"[Sites] Error consultando relaciones para {from_id or to_id}: {exc}")
+            return []
+
+    async def process_site(item: dict, http_client: httpx.AsyncClient) -> SiteWithDevicesResponse:
+        # 1. Extracción robusta de ID (soporta entityId, id, dict, string o int)
+        entity_id_info = item.get("entityId") if item.get("entityId") is not None else item.get("id")
         if isinstance(entity_id_info, dict):
             entity_id = entity_id_info.get("id") or entity_id_info.get("entityId")
             entity_type = entity_id_info.get("entityType", "ASSET")
-        elif isinstance(entity_id_info, str):
-            entity_id = entity_id_info
+        elif isinstance(entity_id_info, (str, int)):
+            entity_id = str(entity_id_info)
             entity_type = "ASSET"
         else:
             entity_id = None
             entity_type = "ASSET"
 
-        if not entity_id:
-            entity_id = item.get("name") or str(id(item))
+        fallback_id = item.get("name") or str(id(item))
+        site_id = str(entity_id) if entity_id is not None else str(fallback_id)
 
         # 2. Extracción robusta de campos (latest.ENTITY_FIELD o raíz)
         latest_fields = item.get("latest", {})
@@ -361,7 +471,7 @@ async def list_sites_with_devices(
 
         name_obj = entity_fields.get("name") if isinstance(entity_fields, dict) else None
         name_val = name_obj.get("value") if isinstance(name_obj, dict) else name_obj
-        name = name_val or item.get("name") or str(entity_id)
+        name = name_val or item.get("name") or site_id
 
         type_obj = entity_fields.get("type") if isinstance(entity_fields, dict) else None
         type_val = type_obj.get("value") if isinstance(type_obj, dict) else type_obj
@@ -371,48 +481,165 @@ async def list_sites_with_devices(
         label_val = label_obj.get("value") if isinstance(label_obj, dict) else label_obj
         label = label_val or item.get("label")
 
-        additional_info = item.get("additionalInfo") or item.get("additional_info")
+        additional_info = _clean_additional_info(item.get("additionalInfo") or item.get("additional_info"))
 
-        # 3. Extraer dispositivos embebidos o relacionados
-        related_devices: List[DeviceSummary] = []
+        site_devices: List[DeviceSummary] = []
+        seen_device_ids: set[str] = set()
+
+        # 3. Consultar relaciones en ThingsBoard si tenemos ID real del activo
+        if entity_id:
+            async with sem:
+                # Consulta principal: Relaciones salientes "Desde" (Asset -> Device)
+                outward_relations = await _safe_get_relations(
+                    http_client=http_client,
+                    from_id=str(entity_id),
+                    from_type="ASSET"
+                )
+
+                for rel in outward_relations:
+                    if not isinstance(rel, dict):
+                        continue
+                    to_info = rel.get("to") if isinstance(rel.get("to"), dict) else {}
+                    if to_info.get("entityType") == "DEVICE":
+                        dev_id = to_info.get("id") or to_info.get("entityId")
+                        if not dev_id:
+                            continue
+                        dev_id_str = str(dev_id)
+                        if dev_id_str in seen_device_ids:
+                            continue
+                        seen_device_ids.add(dev_id_str)
+
+                        if dev_id_str in devices_lookup:
+                            dev_meta = devices_lookup[dev_id_str]
+                            raw_dev_info = dev_meta.get("additionalInfo") or dev_meta.get("additional_info") or rel.get("additionalInfo")
+                            site_devices.append(
+                                DeviceSummary(
+                                    id=dev_id_str,
+                                    name=dev_meta.get("name") or rel.get("toName") or dev_id_str,
+                                    type=dev_meta.get("type") or "default",
+                                    label=dev_meta.get("label"),
+                                    additional_info=_clean_additional_info(raw_dev_info)
+                                )
+                            )
+                        else:
+                            site_devices.append(
+                                DeviceSummary(
+                                    id=dev_id_str,
+                                    name=rel.get("toName") or dev_id_str,
+                                    type="default",
+                                    label=None,
+                                    additional_info=_clean_additional_info(rel.get("additionalInfo"))
+                                )
+                            )
+
+                # Fallback secundario: si no hay relaciones salientes, verificar relaciones entrantes ("Hacia")
+                if not outward_relations:
+                    inward_relations = await _safe_get_relations(
+                        http_client=http_client,
+                        from_id=None,
+                        from_type=None,
+                        to_id=str(entity_id),
+                        to_type="ASSET"
+                    )
+                    for rel in inward_relations:
+                        if not isinstance(rel, dict):
+                            continue
+                        from_info = rel.get("from") if isinstance(rel.get("from"), dict) else {}
+                        if from_info.get("entityType") == "DEVICE":
+                            dev_id = from_info.get("id") or from_info.get("entityId")
+                            if not dev_id:
+                                continue
+                            dev_id_str = str(dev_id)
+                            if dev_id_str in seen_device_ids:
+                                continue
+                            seen_device_ids.add(dev_id_str)
+
+                            if dev_id_str in devices_lookup:
+                                dev_meta = devices_lookup[dev_id_str]
+                                raw_dev_info = dev_meta.get("additionalInfo") or dev_meta.get("additional_info") or rel.get("additionalInfo")
+                                site_devices.append(
+                                    DeviceSummary(
+                                        id=dev_id_str,
+                                        name=dev_meta.get("name") or rel.get("fromName") or dev_id_str,
+                                        type=dev_meta.get("type") or "default",
+                                        label=dev_meta.get("label"),
+                                        additional_info=_clean_additional_info(raw_dev_info)
+                                    )
+                                )
+                            else:
+                                site_devices.append(
+                                    DeviceSummary(
+                                        id=dev_id_str,
+                                        name=rel.get("fromName") or dev_id_str,
+                                        type="default",
+                                        label=None,
+                                        additional_info=_clean_additional_info(rel.get("additionalInfo"))
+                                    )
+                                )
+
+        # 4. Compatibilidad retroactiva: mantener dispositivos embebidos en el payload (item.get("devices"))
         raw_devices = item.get("devices") or item.get("related_devices") or []
         for dev in raw_devices:
+            if not isinstance(dev, dict):
+                continue
             dev_id_info = dev.get("entityId") or dev.get("id") or {}
             if isinstance(dev_id_info, dict):
                 dev_id = dev_id_info.get("id") or dev_id_info.get("entityId") or ""
-            elif isinstance(dev_id_info, str):
-                dev_id = dev_id_info
+            elif isinstance(dev_id_info, (str, int)):
+                dev_id = str(dev_id_info)
             else:
                 dev_id = str(dev_id_info or "")
 
-            if not dev_id:
+            if not dev_id or str(dev_id) in seen_device_ids:
                 continue
+            dev_id_str = str(dev_id)
+            seen_device_ids.add(dev_id_str)
 
-            dev_name = dev.get("name") or dev_id
-            dev_type = dev.get("type", "default")
-            dev_label = dev.get("label")
-            dev_info = dev.get("additionalInfo") or dev.get("additional_info")
-            related_devices.append(
-                DeviceSummary(
-                    id=dev_id,
-                    name=dev_name,
-                    type=dev_type,
-                    label=dev_label,
-                    additional_info=dev_info
+            if dev_id_str in devices_lookup:
+                dev_meta = devices_lookup[dev_id_str]
+                raw_dev_info = dev_meta.get("additionalInfo") or dev_meta.get("additional_info") or dev.get("additionalInfo") or dev.get("additional_info")
+                site_devices.append(
+                    DeviceSummary(
+                        id=dev_id_str,
+                        name=dev_meta.get("name") or dev.get("name") or dev_id_str,
+                        type=dev_meta.get("type") or dev.get("type", "default"),
+                        label=dev_meta.get("label") or dev.get("label"),
+                        additional_info=_clean_additional_info(raw_dev_info)
+                    )
                 )
-            )
+            else:
+                site_devices.append(
+                    DeviceSummary(
+                        id=dev_id_str,
+                        name=dev.get("name") or dev_id_str,
+                        type=dev.get("type", "default"),
+                        label=dev.get("label"),
+                        additional_info=_clean_additional_info(dev.get("additionalInfo") or dev.get("additional_info"))
+                    )
+                )
 
-        site_obj = SiteWithDevicesResponse(
-            id=str(entity_id),
+        return SiteWithDevicesResponse(
+            id=site_id,
             name=str(name),
             type=str(asset_type),
             label=label,
             additional_info=additional_info,
-            devices=related_devices
+            devices=site_devices
         )
-        sites_map[str(entity_id)] = site_obj
 
-    return list(sites_map.values())
+    async with httpx.AsyncClient(timeout=client.timeout) as http_client:
+        tasks = [process_site(item, http_client) for item in data_items]
+        results = await asyncio.gather(*tasks)
+
+    # Deduplicar sitios por id preservando el orden original
+    seen_site_ids: set[str] = set()
+    unique_sites: List[SiteWithDevicesResponse] = []
+    for site in results:
+        if site.id not in seen_site_ids:
+            seen_site_ids.add(site.id)
+            unique_sites.append(site)
+
+    return unique_sites
 
 
 @router.get("/{tenant_id}/devices/{device_id}")
@@ -595,3 +822,134 @@ async def provision_devices(
         errors=errors,
         message=message
     )
+
+
+# ==========================================
+# Gestión de Relaciones Físicas (Topología Edge)
+# ==========================================
+
+@router.post(
+    "/{tenant_id}/devices/{parent_id}/relations/{child_id}",
+    status_code=status.HTTP_201_CREATED,
+    response_model=DeviceRelationResponse,
+    summary="Crear relación física entre dispositivos (Topología Edge)"
+)
+async def create_device_physical_relation(
+    tenant_id: str,
+    parent_id: str,
+    child_id: str,
+    relation_type: Optional[str] = Query(None, description="Tipo de relación personalizada (ej: Edge_Link)"),
+    request_data: Optional[DeviceRelationRequest] = None,
+    current_user: User = Depends(CasbinAuth(obj="devices", act="write"))
+) -> DeviceRelationResponse:
+    """
+    Crea una relación física/edge entre dos dispositivos en ThingsBoard.
+    - parent_id: Dispositivo raíz/Gateway/Edge (from).
+    - child_id: Dispositivo subordinado/Sensor (to).
+    - relation_type: Obligatorio vía query string o payload JSON.
+    """
+    # 1. Extraer y validar relation_type obligatorio
+    rel_type: Optional[str] = None
+    if relation_type and relation_type.strip():
+        rel_type = relation_type.strip()
+    elif request_data and request_data.relation_type and request_data.relation_type.strip():
+        rel_type = request_data.relation_type.strip()
+
+    if not rel_type:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El parámetro 'relation_type' es obligatorio (por query string o payload JSON)."
+        )
+
+    # 2. Resolución Inversa de Tenant y Servidor
+    tenant, server = await _resolve_tenant_and_server(tenant_id, current_user)
+    client, token = await _get_authenticated_client(tenant, server)
+
+    # 3. Construcción del Payload para ThingsBoard
+    tb_payload = {
+        "from": {
+            "id": parent_id,
+            "entityType": "DEVICE"
+        },
+        "to": {
+            "id": child_id,
+            "entityType": "DEVICE"
+        },
+        "type": rel_type,
+        "typeGroup": "COMMON"
+    }
+
+    base_server_url = server.base_url.rstrip("/")
+    primary_url = f"{base_server_url}/api/relations"
+    fallback_url = f"{base_server_url}/api/relation"
+
+    # 4. Despacho Asíncrono con HTTPX y Manejo de 401/404 Fallback
+    async with httpx.AsyncClient(timeout=client.timeout) as http_client:
+        async def _post_relation(target_url: str, auth_token: str) -> httpx.Response:
+            headers = {
+                "X-Authorization": f"Bearer {auth_token}",
+                "Content-Type": "application/json",
+            }
+            return await http_client.post(target_url, json=tb_payload, headers=headers)
+
+        try:
+            target_url = primary_url
+            response = await _post_relation(target_url, token)
+
+            # Si ThingsBoard responde 401, re-autenticar y reintentar una vez
+            if response.status_code == 401:
+                logger.warning(
+                    f"[DeviceRelations] Token expirado (401) para Tenant '{tenant.name}'. "
+                    "Re-autenticando y reintentando..."
+                )
+                token = await _reauthenticate_tenant(tenant, client)
+                response = await _post_relation(target_url, token)
+
+            # Fallback transparente si 404 en /api/relations -> intentar /api/relation
+            if response.status_code == 404 and target_url == primary_url:
+                logger.info(
+                    f"[DeviceRelations] Endpoint {primary_url} retornó 404. "
+                    f"Aplicando fallback a {fallback_url}..."
+                )
+                target_url = fallback_url
+                response = await _post_relation(target_url, token)
+
+                if response.status_code == 401:
+                    logger.warning(
+                        f"[DeviceRelations] Token expirado (401) en fallback para Tenant '{tenant.name}'. "
+                        "Re-autenticando..."
+                    )
+                    token = await _reauthenticate_tenant(tenant, client)
+                    response = await _post_relation(target_url, token)
+
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            err_text = exc.response.text
+            status_code = exc.response.status_code
+            logger.error(
+                f"[DeviceRelations] Error de ThingsBoard ({status_code}) al crear relación: {err_text}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Error en ThingsBoard ({status_code}) al crear relación: {err_text}"
+            )
+        except Exception as exc:
+            logger.error(f"[DeviceRelations] Error de conexión hacia ThingsBoard: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Error de conexión hacia ThingsBoard: {str(exc)}"
+            )
+
+    logger.info(
+        f"[DeviceRelations] Relación '{rel_type}' creada exitosamente entre '{parent_id}' y '{child_id}' (Tenant: '{tenant.name}')."
+    )
+
+    return DeviceRelationResponse(
+        status="success",
+        tenant_id=tenant_id,
+        parent_id=parent_id,
+        child_id=child_id,
+        relation_type=rel_type,
+        message=f"Relación '{rel_type}' creada exitosamente entre '{parent_id}' y '{child_id}'."
+    )
+

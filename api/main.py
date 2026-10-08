@@ -14,6 +14,7 @@ from api.endpoints.telemetry import router as telemetry_router
 from api.endpoints.devices import router as devices_router
 from api.endpoints.scheduler import router as scheduler_router
 from api.endpoints.utils import router as utils_router
+from api.endpoints.tasks import router as tasks_router
 from fastapi.middleware.cors import CORSMiddleware
 from api.middlewares.audit_log import AuditLogMiddleware
 
@@ -62,6 +63,7 @@ app.include_router(telemetry_router, prefix="/api/v1/telemetry", tags=["Telemetr
 app.include_router(devices_router, prefix="/api/v1/tenants", tags=["Dispositivos y Aprovisionamiento"])
 app.include_router(scheduler_router, prefix="/api/v1/scheduler/tasks", tags=["Scheduler y Tareas Programadas"])
 app.include_router(utils_router, prefix="/api/v1/utils", tags=["Utilidades y Sistema"])
+app.include_router(tasks_router, prefix="/api/v1/tasks", tags=["Gestión de Tareas"])
 
 # Compatibilidad con rutas v0 / legacy y alias de conveniencia
 app.include_router(auth_router, prefix="/api/auth", include_in_schema=False)
@@ -71,8 +73,18 @@ app.include_router(utils_router, prefix="/api/v1", include_in_schema=False)
 app.include_router(utils_router, prefix="/api/utils", include_in_schema=False)
 
 
-@app.api_route("/", methods=["GET", "POST"])
-async def root():
+@app.get("/", operation_id="root_get")
+async def root_get():
+    return {
+        "status": "ok",
+        "service": settings.PROJECT_NAME,
+        "version": "2.0.0",
+        "message": "ThingsBoard Super API Gateway activo con MongoDB y Beanie ODM"
+    }
+
+
+@app.post("/", operation_id="root_post")
+async def root_post():
     return {
         "status": "ok",
         "service": settings.PROJECT_NAME,

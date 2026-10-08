@@ -365,8 +365,18 @@ async def run_excel_report_orchestrator(
 
     tz = ZoneInfo(time_zone_str)
     now_dt = datetime.now(tz)
-    start_dt = datetime.fromisoformat(start_date_str).replace(tzinfo=tz)
-    end_dt = datetime.fromisoformat(end_date_str).replace(tzinfo=tz)
+
+    def _parse_target_datetime(date_str: str, target_tz: ZoneInfo) -> datetime:
+        clean = date_str.strip()
+        if clean.endswith("Z"):
+            clean = clean[:-1] + "+00:00"
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=target_tz)
+        return dt.astimezone(target_tz)
+
+    start_dt = _parse_target_datetime(start_date_str, tz)
+    end_dt = _parse_target_datetime(end_date_str, tz)
 
     intervals = get_month_intervals(start_dt, end_dt, now_dt)
 
@@ -388,7 +398,8 @@ async def run_excel_report_orchestrator(
             current_device=None,
             current_key=None,
             progress_pct=0.0,
-            total_records=0
+            total_records=0,
+            task_type="excel_report"
         )
 
         # 2. Descubrimiento de dispositivos
@@ -479,7 +490,8 @@ async def run_excel_report_orchestrator(
             status="DOWNLOADING",
             tenant_name=tenant_name,
             progress_pct=10.0,
-            total_records=0
+            total_records=0,
+            task_type="excel_report"
         )
 
         for eid, d_name in devices_info:
@@ -547,7 +559,8 @@ async def run_excel_report_orchestrator(
             status="PACKAGING",
             tenant_name=tenant_name,
             progress_pct=85.0,
-            total_records=total_extracted_records
+            total_records=total_extracted_records,
+            task_type="excel_report"
         )
 
         start_fmt = start_dt.strftime("%Y%m%d")
@@ -619,6 +632,7 @@ async def run_excel_report_orchestrator(
                     task_id=task_id,
                     requested_by=user_id,
                     file_name=final_artifact_name,
+                    backup_type="excel_report",
                     start_date=start_dt,
                     end_date=end_dt,
                     file_size_bytes=file_size,
@@ -638,7 +652,8 @@ async def run_excel_report_orchestrator(
             tenant_name=tenant_name,
             progress_pct=100.0,
             total_records=total_extracted_records,
-            cleanup_on_terminal=True
+            cleanup_on_terminal=True,
+            task_type="excel_report"
         )
 
         return {
@@ -672,7 +687,8 @@ async def run_excel_report_orchestrator(
                 tenant_name=tenant_name,
                 progress_pct=0.0,
                 total_records=0,
-                cleanup_on_terminal=True
+                cleanup_on_terminal=True,
+                task_type="excel_report"
             )
         except Exception:
             pass

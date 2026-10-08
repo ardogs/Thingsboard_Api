@@ -547,6 +547,55 @@ AVAILABLE_TASKS_CATALOG: list[AvailableTaskResponse] = [
                 description="Configuración opcional de llaves (whitelist), reglas de color y agregación.",
                 required=False,
                 default=None
+            ),
+            TaskParameterInfo(
+                name="send_email",
+                type="boolean",
+                description="Bandera que indica si el envío de correo está activo y debe ser procesado.",
+                required=False,
+                default=False
+            ),
+            TaskParameterInfo(
+                name="to_email",
+                type="string",
+                description="Para: Correo o lista de destinatarios (obligatorio si send_email=True).",
+                required=False,
+                default=None
+            ),
+            TaskParameterInfo(
+                name="subject",
+                type="string",
+                description="Asunto personalizado del correo (opcional).",
+                required=False,
+                default=None
+            ),
+            TaskParameterInfo(
+                name="cc",
+                type="string",
+                description="Con copia (CC): Dirección o lista de correos en copia.",
+                required=False,
+                default=None
+            ),
+            TaskParameterInfo(
+                name="bcc",
+                type="string",
+                description="Con copia oculta (BCC): Dirección o lista de correos en copia oculta.",
+                required=False,
+                default=None
+            ),
+            TaskParameterInfo(
+                name="body",
+                type="string",
+                description="Cuerpo personalizado del correo (texto plano o HTML).",
+                required=False,
+                default=None
+            ),
+            TaskParameterInfo(
+                name="from_email",
+                type="string",
+                description="De*: Remitente opcional para sobreescribir la configuración SMTP cargada.",
+                required=False,
+                default=None
             )
         ],
         aliases=["generate_monthly_heatmap_task", "generate_monthly_heatmap"]

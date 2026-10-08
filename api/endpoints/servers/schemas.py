@@ -355,3 +355,42 @@ class TenantResponse(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+# ==========================================
+# DTOs: Ejecución SSH Remota
+# ==========================================
+
+class SSHExecuteRequest(BaseModel):
+    """
+    Esquema de solicitud para ejecutar un comando SSH autorizado en el servidor ThingsBoard.
+    El comando está restringido a una lista blanca estricta con filtrado de metacaracteres.
+    """
+    command: str = Field(
+        ...,
+        min_length=1,
+        description="Comando SSH a ejecutar perteneciente a la lista blanca permitida"
+    )
+    timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        description="Tiempo máximo de espera para la ejecución del comando en segundos"
+    )
+
+
+class SSHExecuteResponse(BaseModel):
+    """
+    Esquema de respuesta tras la ejecución remota de un comando SSH en el servidor.
+    Contiene el código de salida, salidas estándar (stdout/stderr) y telemetría de ejecución.
+    """
+    server_id: str
+    server_name: str
+    host: str
+    command: str
+    exit_status: int
+    stdout: str
+    stderr: str
+    executed_at: datetime
+    duration_ms: float
+

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import gc
@@ -7,7 +9,7 @@ import time
 import uuid
 import httpx
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union, Tuple
 from arq import Retry
 import redis.asyncio as redis
 from beanie import PydanticObjectId
@@ -21,8 +23,11 @@ from core.models.tb_scheduled_task import TBScheduledTask
 from core.models.tb_email_config import TBEmailConfig
 from core.tb_client import ThingsBoardClient
 from core.redis_client import redis_client, get_redis_client
-from core.logger import logger
+from core.logger import get_logger
+from core.services.task_registry import publish_task_event
 from core.io_limiter import async_rmtree, async_remove_file
+
+logger = get_logger("arq_worker")
 from core.services.telemetry_service import (
     run_download_orchestrator,
     publish_task_status,
@@ -32,13 +37,20 @@ from core.services.telemetry_service import (
     refresh_tenant_tokens_in_db
 )
 from core.services.excel_report_service import run_excel_report_orchestrator
-from core.services.heatmap_report_service import generate_heatmap_report_pdf
+from core.services.heatmap_report_service import (
+    generate_heatmap_report_pdf,
+    interpolate_heatmap_placeholders,
+    extract_heatmap_whitelist_and_config,
+    build_or_normalize_heatmap_matrix
+)
 from core.services.incremental_backup_service import (
     calculate_previous_month_boundaries,
     run_incremental_tenant_backup
 )
 import aiosmtplib
 from core.services.email_service import send_email_async
+from core.services.alert_dispatcher import dispatch_debounced_alert, send_telegram_alert
+from core.services.hierarchical_suppression_service import check_parent_gateway_status
 
 GLOBAL_REGISTRY_KEY = "tb_events:global_registry"
 STREAM_CHANNEL_PREFIX = "tb_events:stream"
@@ -179,7 +191,8 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
             task_id=job_id,
             status="CANCELLED",
             tenant_name=tenant_name,
-            cleanup_on_terminal=True
+            cleanup_on_terminal=True,
+            task_type="telemetry"
         )
         raise
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -194,7 +207,8 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
                 task_id=job_id,
                 status="ERROR",
                 tenant_name=tenant_name,
-                cleanup_on_terminal=True
+                cleanup_on_terminal=True,
+                task_type="telemetry"
             )
             raise exc
     except httpx.HTTPStatusError as exc:
@@ -210,7 +224,8 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
                 task_id=job_id,
                 status="ERROR",
                 tenant_name=tenant_name,
-                cleanup_on_terminal=True
+                cleanup_on_terminal=True,
+                task_type="telemetry"
             )
             raise exc
     except Exception as exc:
@@ -221,7 +236,8 @@ async def download_telemetry_task(ctx: dict, payload: Optional[dict] = None, **k
             task_id=job_id,
             status="ERROR",
             tenant_name=tenant_name,
-            cleanup_on_terminal=True
+            cleanup_on_terminal=True,
+            task_type="telemetry"
         )
         raise exc
     finally:
@@ -372,7 +388,8 @@ async def generate_excel_report_task(ctx: dict, payload: Optional[dict] = None, 
             task_id=job_id,
             status="CANCELLED",
             tenant_name=tenant_name,
-            cleanup_on_terminal=True
+            cleanup_on_terminal=True,
+            task_type="excel_report"
         )
         raise
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -387,7 +404,8 @@ async def generate_excel_report_task(ctx: dict, payload: Optional[dict] = None, 
                 task_id=job_id,
                 status="ERROR",
                 tenant_name=tenant_name,
-                cleanup_on_terminal=True
+                cleanup_on_terminal=True,
+                task_type="excel_report"
             )
             raise exc
     except httpx.HTTPStatusError as exc:
@@ -402,7 +420,8 @@ async def generate_excel_report_task(ctx: dict, payload: Optional[dict] = None, 
                 task_id=job_id,
                 status="ERROR",
                 tenant_name=tenant_name,
-                cleanup_on_terminal=True
+                cleanup_on_terminal=True,
+                task_type="excel_report"
             )
             raise exc
     except Exception as exc:
@@ -413,7 +432,8 @@ async def generate_excel_report_task(ctx: dict, payload: Optional[dict] = None, 
             task_id=job_id,
             status="ERROR",
             tenant_name=tenant_name,
-            cleanup_on_terminal=True
+            cleanup_on_terminal=True,
+            task_type="excel_report"
         )
         raise exc
     finally:
@@ -460,6 +480,7 @@ async def generate_monthly_heatmap_task(
     8. Registra el artefacto en TBBackup (MongoDB).
     9. Bloque finally: garantiza la liberación del candado distribuido y limpieza defensiva del entorno.
     """
+    import re
     import calendar
     from zoneinfo import ZoneInfo
     import matplotlib.pyplot as plt
@@ -540,7 +561,8 @@ async def generate_monthly_heatmap_task(
             status="DOWNLOADING",
             tenant_name=tenant_name,
             progress_pct=10.0,
-            total_records=0
+            total_records=0,
+            task_type="heatmap"
         )
 
         # 4. Consultar dispositivos del Tenant
@@ -619,43 +641,20 @@ async def generate_monthly_heatmap_task(
 
         # 6. Leer custom_metadata.heatmap_config (lista blanca de llaves y reglas)
         custom_metadata = tenant.custom_metadata or {}
-        heatmap_config = custom_metadata.get("heatmap_config") or actual_payload.get("heatmap_config") or {}
-
-        # Whitelist de llaves de telemetría y reglas (soporta formato lista o diccionario)
-        if isinstance(heatmap_config, list):
-            whitelist_keys = list(heatmap_config)
-            rules = actual_payload.get("rules") or []
-            time_zone_str = actual_payload.get("time_zone") or settings.APP_TIMEZONE
-            agg_func = "AVG"
-            raw_year = actual_payload.get("year")
-            raw_month = actual_payload.get("month")
-        elif isinstance(heatmap_config, dict):
-            whitelist_keys = (
-                heatmap_config.get("keys")
-                or heatmap_config.get("whitelist")
-                or heatmap_config.get("telemetry_keys")
-                or actual_payload.get("keys")
-                or []
-            )
-            rules = heatmap_config.get("rules") or actual_payload.get("rules") or []
-            time_zone_str = (
-                heatmap_config.get("time_zone")
-                or actual_payload.get("time_zone")
-                or settings.APP_TIMEZONE
-            )
-            agg_func = str(heatmap_config.get("aggregation", "AVG")).strip().upper()
-            raw_year = actual_payload.get("year") or heatmap_config.get("year")
-            raw_month = actual_payload.get("month") or heatmap_config.get("month")
-        else:
-            whitelist_keys = actual_payload.get("keys") or []
-            rules = actual_payload.get("rules") or []
-            time_zone_str = actual_payload.get("time_zone") or settings.APP_TIMEZONE
-            agg_func = "AVG"
-            raw_year = actual_payload.get("year")
-            raw_month = actual_payload.get("month")
-
-        if isinstance(whitelist_keys, str):
-            whitelist_keys = [k.strip() for k in whitelist_keys.split(",") if k.strip()]
+        # Whitelist aislada: Se lee EXCLUSIVAMENTE de custom_metadata.heatmap_config
+        heatmap_config = custom_metadata.get("heatmap_config") or {}
+        (
+            whitelist_keys,
+            rules,
+            time_zone_str,
+            agg_func,
+            raw_year,
+            raw_month
+        ) = extract_heatmap_whitelist_and_config(
+            heatmap_config=heatmap_config,
+            actual_payload=actual_payload,
+            default_timezone=settings.APP_TIMEZONE
+        )
 
         tz = ZoneInfo(time_zone_str)
 
@@ -677,8 +676,15 @@ async def generate_monthly_heatmap_task(
         end_ts = int(end_dt.timestamp() * 1000)
         day_columns = [f"{d:02d}" for d in range(1, last_day + 1)]
 
+        SPANISH_MONTHS = [
+            "", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+        ]
+        default_mes_nombre = SPANISH_MONTHS[m].capitalize() if 1 <= m <= 12 else str(m)
+
         heatmap_sections: List[dict] = []
         total_datapoints = 0
+        telemetry_period_detected: Optional[Tuple[int, int]] = None
 
         # Si no hay dispositivos activos con heatmap_active, generar reporte informativo
         if not active_devices:
@@ -688,27 +694,66 @@ async def generate_monthly_heatmap_task(
                 "metric_name": "Sin Datos",
                 "data": [["NA"] * 24],
                 "rules": rules,
-                "title": f"Reporte mensual {y} | mapas de calor",
+                "title": f"Reporte mensual mapas de calor {default_mes_nombre} {y}",
+                "period": period_label,
+                "tenant_name": tenant_name,
+            })
+        elif not whitelist_keys:
+            logger.warning(
+                f"[Heatmap Task] El tenant '{tenant_name}' no posee una lista blanca de variables configurada "
+                f"en custom_metadata.heatmap_config. No se procesará ninguna variable ajena."
+            )
+            heatmap_sections.append({
+                "device_name": active_devices[0][1] if active_devices else "Sin Dispositivos",
+                "metric_name": "Sin Variables Admitidas",
+                "data": [["NA"] * 24],
+                "rules": rules,
+                "title": f"Reporte mensual mapas de calor {default_mes_nombre} {y}",
                 "period": period_label,
                 "tenant_name": tenant_name,
             })
         else:
-            # Si no se configuró whitelist, consultar llaves del primer dispositivo activo
-            if not whitelist_keys:
-                first_d_id = active_devices[0][0]
-                try:
-                    all_keys = await tb_client.get_entity_timeseries_keys(entity_id=first_d_id, token=token_ref[0])
-                    whitelist_keys = all_keys[:1] if all_keys else ["telemetry"]
-                except Exception:
-                    whitelist_keys = ["telemetry"]
-
             # 7. Extraer telemetría vía API para cada dispositivo activo y cada llave permitida
             for d_id, d_name in active_devices:
+                # Consultar llaves reales registradas en el dispositivo para resolución inteligente
+                try:
+                    dev_keys = await tb_client.get_entity_timeseries_keys(entity_id=d_id, token=token_ref[0])
+                    if not isinstance(dev_keys, list):
+                        dev_keys = []
+                except Exception:
+                    dev_keys = []
+
                 for t_key in whitelist_keys:
+                    # Resolver llave objetivo para el dispositivo según la lista blanca (soporta HM_ y case-insensitive)
+                    target_key = t_key
+                    if dev_keys:
+                        alt_cand = t_key[3:] if t_key.startswith("HM_") else f"HM_{t_key}"
+                        matched_key = None
+
+                        if t_key in dev_keys:
+                            matched_key = t_key
+                        elif alt_cand in dev_keys:
+                            matched_key = alt_cand
+                        else:
+                            ci_map = {k.lower(): k for k in dev_keys}
+                            if t_key.lower() in ci_map:
+                                matched_key = ci_map[t_key.lower()]
+                            elif alt_cand.lower() in ci_map:
+                                matched_key = ci_map[alt_cand.lower()]
+
+                        if not matched_key:
+                            logger.info(
+                                f"[Heatmap Task] Variable '{t_key}' no presente en las llaves del dispositivo '{d_name}'. "
+                                f"No se procesará ninguna variable ajena."
+                            )
+                            continue
+                        target_key = matched_key
+
+                    # Intento 1: Rango estricto del mes
                     try:
                         telem_res = await tb_client.get_entity_telemetry(
                             entity_id=d_id,
-                            keys=t_key,
+                            keys=target_key,
                             start_ts=start_ts,
                             end_ts=end_ts,
                             limit=10000,
@@ -724,7 +769,7 @@ async def generate_monthly_heatmap_task(
                             )
                             telem_res = await tb_client.get_entity_telemetry(
                                 entity_id=d_id,
-                                keys=t_key,
+                                keys=target_key,
                                 start_ts=start_ts,
                                 end_ts=end_ts,
                                 limit=10000,
@@ -733,19 +778,134 @@ async def generate_monthly_heatmap_task(
                         else:
                             telem_res = {}
                     except Exception as e:
-                        logger.warning(f"[Heatmap Task] Error descargando telemetría de '{d_name}' (llave '{t_key}'): {e}")
+                        logger.warning(f"[Heatmap Task] Error descargando telemetría de '{d_name}' (llave '{target_key}'): {e}")
                         telem_res = {}
 
-                    points = telem_res.get(t_key, [])
+                    # Extracción estricta de puntos (únicamente target_key exacto o case-insensitive)
+                    points = []
+                    if telem_res:
+                        if target_key in telem_res and isinstance(telem_res[target_key], list):
+                            points = telem_res[target_key]
+                        else:
+                            for k, v in telem_res.items():
+                                if k.lower() == target_key.lower() and isinstance(v, list):
+                                    points = v
+                                    break
+
+                    # Fallback si no hay puntos en el rango estricto:
+                    # Resúmenes mensuales precalculados suelen guardarse con la fecha de cálculo en el mes posterior
+                    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                    if not points:
+                        try:
+                            res_ext = await tb_client.get_entity_telemetry(
+                                entity_id=d_id,
+                                keys=target_key,
+                                start_ts=start_ts,
+                                end_ts=now_ms + 86400000,
+                                limit=100,
+                                token=token_ref[0]
+                            )
+                            if res_ext:
+                                if target_key in res_ext and isinstance(res_ext[target_key], list):
+                                    points = res_ext[target_key]
+                                else:
+                                    for k, v in res_ext.items():
+                                        if k.lower() == target_key.lower() and isinstance(v, list):
+                                            points = v
+                                            break
+                        except Exception as e:
+                            logger.debug(f"[Heatmap Task] Error en consulta extendida para '{d_name}' (llave '{target_key}'): {e}")
+
+                    if not points:
+                        try:
+                            res_latest = await tb_client.get_entity_telemetry(
+                                entity_id=d_id,
+                                keys=target_key,
+                                start_ts=0,
+                                end_ts=now_ms + 86400000,
+                                limit=10,
+                                token=token_ref[0]
+                            )
+                            if res_latest:
+                                if target_key in res_latest and isinstance(res_latest[target_key], list):
+                                    points = res_latest[target_key]
+                                else:
+                                    for k, v in res_latest.items():
+                                        if k.lower() == target_key.lower() and isinstance(v, list):
+                                            points = v
+                                            break
+                        except Exception as e:
+                            logger.debug(f"[Heatmap Task] Error en consulta histórica para '{d_name}' (llave '{target_key}'): {e}")
+
                     total_datapoints += len(points)
 
                     matrix_data = None
                     metric_rules = list(rules)
 
+                    # Determinar mes y año del reporte según la fecha de la telemetría leída
+                    # "Tomando como base que la fecha escrita en esa telemetria corresponde al mes anterior"
+                    sec_year = y
+                    sec_month = m
+
+                    if points:
+                        date_extracted = None
+                        telem_ts = None
+                        for pt in points:
+                            if not isinstance(pt, dict):
+                                continue
+                            val = pt.get("value")
+                            if isinstance(val, str) and "{" in val:
+                                try:
+                                    p_data = json.loads(val)
+                                    if isinstance(p_data, dict):
+                                        d_cand = p_data.get("date") or p_data.get("fecha") or p_data.get("period")
+                                        if d_cand:
+                                            m_d = re.search(r"(\d{4})[-/](\d{1,2})", str(d_cand))
+                                            if m_d:
+                                                date_extracted = (int(m_d.group(1)), int(m_d.group(2)))
+                                                break
+                                except Exception:
+                                    pass
+                            if pt.get("ts") and telem_ts is None:
+                                telem_ts = pt.get("ts")
+
+                        # La fecha del reporte está en función de la telemetría leída menos 1 mes
+                        if date_extracted:
+                            t_y, t_m = date_extracted
+                            if t_m == 1:
+                                sec_year = t_y - 1
+                                sec_month = 12
+                            else:
+                                sec_year = t_y
+                                sec_month = t_m - 1
+                            if telemetry_period_detected is None:
+                                telemetry_period_detected = (sec_year, sec_month)
+                        elif telem_ts:
+                            t_dt = datetime.fromtimestamp(telem_ts / 1000.0, tz=timezone.utc).astimezone(tz)
+                            if t_dt.month == 1:
+                                sec_year = t_dt.year - 1
+                                sec_month = 12
+                            else:
+                                sec_year = t_dt.year
+                                sec_month = t_dt.month - 1
+                            if telemetry_period_detected is None:
+                                telemetry_period_detected = (sec_year, sec_month)
+
+                    sec_mes_nombre = SPANISH_MONTHS[sec_month].capitalize() if 1 <= sec_month <= 12 else str(sec_month)
+                    sec_title = f"Reporte mensual mapas de calor {sec_mes_nombre} {sec_year}"
+
                     # Caso 1: Verificar si el punto de telemetría es un JSON precalculado {"data": [...], "rules": [...]}
                     for pt in points:
+                        if not isinstance(pt, dict):
+                            continue
                         val = pt.get("value")
-                        if isinstance(val, str) and "data" in val:
+                        if isinstance(val, dict):
+                            if "data" in val and isinstance(val["data"], list):
+                                matrix_data = val["data"]
+                                if "rules" in val and val["rules"]:
+                                    metric_rules = val["rules"]
+                                break
+                        elif isinstance(val, str) and ("data" in val or "{" in val):
                             try:
                                 parsed = json.loads(val)
                                 if isinstance(parsed, dict) and "data" in parsed and isinstance(parsed["data"], list):
@@ -756,49 +916,38 @@ async def generate_monthly_heatmap_task(
                             except Exception:
                                 pass
 
-                    # Caso 2: Si no es una matriz precalculada, agregar puntos por día y hora (last_day x 24 horas)
-                    if matrix_data is None:
-                        hourly_buckets = [[[] for _ in range(24)] for _ in range(last_day)]
-                        for pt in points:
-                            ts = pt.get("ts")
-                            val = pt.get("value")
-                            if ts is not None and val is not None:
-                                try:
-                                    num_v = float(val)
-                                    pt_dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(tz)
-                                    if 1 <= pt_dt.day <= last_day and 0 <= pt_dt.hour < 24:
-                                        hourly_buckets[pt_dt.day - 1][pt_dt.hour].append(num_v)
-                                except (ValueError, TypeError):
-                                    pass
-
-                        matrix_data = []
-                        for d_idx in range(last_day):
-                            row = []
-                            for h_idx in range(24):
-                                b = hourly_buckets[d_idx][h_idx]
-                                if not b:
-                                    row.append("NA")
-                                elif agg_func == "MAX":
-                                    row.append(round(max(b), 2))
-                                elif agg_func == "MIN":
-                                    row.append(round(min(b), 2))
-                                elif agg_func == "SUM":
-                                    row.append(round(sum(b), 2))
-                                elif agg_func == "LAST":
-                                    row.append(round(b[-1], 2))
-                                else:  # Default: AVG
-                                    row.append(round(sum(b) / len(b), 2))
-                            matrix_data.append(row)
+                    # Normalizar o construir matrix_data (last_day x 24 horas)
+                    matrix_data = build_or_normalize_heatmap_matrix(
+                        points=points,
+                        last_day=last_day,
+                        agg_func=agg_func,
+                        tz=tz,
+                        existing_matrix=matrix_data
+                    )
 
                     heatmap_sections.append({
                         "device_name": d_name,
-                        "metric_name": t_key,
+                        "metric_name": target_key,
                         "data": matrix_data,
                         "rules": metric_rules,
-                        "title": f"Reporte mensual {y} | mapas de calor",
-                        "period": period_label,
+                        "title": sec_title,
+                        "period": f"{sec_year}-{sec_month:02d}",
                         "tenant_name": tenant_name,
                     })
+
+            if not heatmap_sections:
+                logger.warning(
+                    f"[Heatmap Task] Ningún dispositivo activo posee las variables admitidas {whitelist_keys} para '{tenant_name}'"
+                )
+                heatmap_sections.append({
+                    "device_name": active_devices[0][1] if active_devices else "Sin Dispositivos",
+                    "metric_name": "Sin Datos",
+                    "data": [["NA"] * 24],
+                    "rules": rules,
+                    "title": f"Reporte mensual mapas de calor {default_mes_nombre} {y}",
+                    "period": period_label,
+                    "tenant_name": tenant_name,
+                })
 
         # 8. Delegar generación a heatmap_report_service
         await publish_task_status(
@@ -808,21 +957,42 @@ async def generate_monthly_heatmap_task(
             status="PACKAGING",
             tenant_name=tenant_name,
             progress_pct=80.0,
-            total_records=total_datapoints
+            total_records=total_datapoints,
+            task_type="heatmap"
         )
 
+        # Determinar mes y año efectivos del reporte en función de la telemetría leída menos 1 mes
+        if telemetry_period_detected:
+            effective_year, effective_month = telemetry_period_detected
+            effective_mes_nombre = SPANISH_MONTHS[effective_month].capitalize() if 1 <= effective_month <= 12 else str(effective_month)
+            effective_period = f"{effective_year}-{effective_month:02d}"
+        else:
+            effective_year = y
+            effective_month = m
+            effective_mes_nombre = default_mes_nombre
+            effective_period = period_label
+
+        final_report_title = (
+            heatmap_sections[0]["title"]
+            if heatmap_sections
+            else f"Reporte mensual mapas de calor {effective_mes_nombre} {effective_year}"
+        )
+        logger.info(
+            f"[Heatmap Task] Período efectivo del reporte (telemetría - 1 mes): {effective_period} "
+            f"({effective_mes_nombre} {effective_year})"
+        )
         logger.info(f"[Heatmap Task] Delegando generación de {len(heatmap_sections)} secciones a heatmap_report_service: {output_pdf_path}")
         await generate_heatmap_report_pdf(
             matrix_data=heatmap_sections,
             rules=rules,
             output_pdf_path=output_pdf_path,
-            title=f"Reporte mensual {y} | mapas de calor",
-            subtitle=f"Tenant: <b>{tenant_name}</b> | Período: <b>{period_label}</b>",
+            title=final_report_title,
+            subtitle=f"Tenant: <b>{tenant_name}</b> | Período: <b>{effective_period}</b>",
             metadata={
                 "tenant_name": tenant_name,
                 "key": ", ".join(whitelist_keys) if whitelist_keys else "General",
-                "period": period_label,
-                "year": y
+                "period": effective_period,
+                "year": effective_year
             }
         )
 
@@ -835,6 +1005,7 @@ async def generate_monthly_heatmap_task(
                 task_id=job_id,
                 requested_by=user_id,
                 file_name=pdf_filename,
+                backup_type="heatmap",
                 start_date=start_dt,
                 end_date=end_dt,
                 file_size_bytes=file_size,
@@ -845,7 +1016,211 @@ async def generate_monthly_heatmap_task(
         except Exception as bkp_err:
             logger.warning(f"[MongoDB] Advertencia registrando en TBBackup: {bkp_err}")
 
-        # 10. Finalización exitosa
+        # 10. Envío por correo electrónico del último archivo generado si la bandera está activa
+        email_sent_status = False
+        email_delivery_data = None
+
+        email_opts = actual_payload.get("email_options") or {}
+        if not isinstance(email_opts, dict):
+            email_opts = {}
+
+        send_email_flag = bool(
+            actual_payload.get("send_email")
+            or actual_payload.get("email_enabled")
+            or email_opts.get("enabled")
+        )
+
+        if send_email_flag:
+            logger.info(f"[Heatmap Task] Envío por correo electrónico activado para tarea {job_id}.")
+            await publish_task_status(
+                redis_client=redis_conn,
+                user_id=user_id,
+                task_id=job_id,
+                status="SENDING_EMAIL",
+                tenant_name=tenant_name,
+                progress_pct=90.0,
+                total_records=total_datapoints,
+                task_type="heatmap"
+            )
+
+            try:
+                # Cargar configuración SMTP dinámica de MongoDB (Singleton)
+                email_config = await TBEmailConfig.get_singleton()
+                if not email_config:
+                    email_config = await TBEmailConfig.find_one({"is_active": True})
+
+                if not email_config:
+                    error_email_msg = (
+                        "No se encontró ninguna configuración de correo activa (TBEmailConfig) en MongoDB. "
+                        "Registre o active los parámetros SMTP antes de solicitar el envío de reportes por correo."
+                    )
+                    logger.error(f"[Heatmap Task] {error_email_msg}")
+                    raise ValueError(error_email_msg)
+
+                # 1. De* [opción obtenida de la configuración cargada o personalizada si se provee]
+                configured_sender = email_config.sender_email or email_config.username
+                custom_from = actual_payload.get("from_email") or email_opts.get("from_email")
+                sender = custom_from or configured_sender
+
+                configured_sender_name = email_config.sender_name
+                custom_from_name = (
+                    actual_payload.get("from_name")
+                    or actual_payload.get("sender_name")
+                    or email_opts.get("from_name")
+                    or email_opts.get("sender_name")
+                )
+                sender_name = custom_from_name or configured_sender_name
+
+                # 2. Para (destinatario)
+                target_to = (
+                    actual_payload.get("to_email")
+                    or email_opts.get("to_email")
+                    or actual_payload.get("recipient")
+                    or email_opts.get("recipient")
+                )
+                if not target_to:
+                    raise ValueError("El campo 'to_email' (destinatario) es obligatorio cuando el envío de correo está activo.")
+
+                # 3. Asunto (evaluado con mes y año efectivos: telemetría leída - 1 mes)
+                raw_subject = (
+                    actual_payload.get("subject")
+                    or actual_payload.get("email_subject")
+                    or email_opts.get("subject")
+                    or f"Reporte Mensual de Mapa de Calor - {tenant_name} ({effective_period})"
+                )
+                target_subject = interpolate_heatmap_placeholders(
+                    text=raw_subject,
+                    mes_nombre=effective_mes_nombre,
+                    anio=effective_year,
+                    period=effective_period,
+                    tenant=tenant_name,
+                )
+
+                # 4. Con copia (CC)
+                target_cc = (
+                    actual_payload.get("cc")
+                    or actual_payload.get("email_cc")
+                    or email_opts.get("cc")
+                )
+
+                # 5. Con copia oculta (BCC)
+                target_bcc = (
+                    actual_payload.get("bcc")
+                    or actual_payload.get("email_bcc")
+                    or email_opts.get("bcc")
+                )
+
+                # 6. Cuerpo
+                custom_body = (
+                    actual_payload.get("body")
+                    or actual_payload.get("email_body")
+                    or actual_payload.get("html_body")
+                    or email_opts.get("body")
+                    or email_opts.get("html_body")
+                )
+                if custom_body:
+                    email_body_html = interpolate_heatmap_placeholders(
+                        text=custom_body,
+                        mes_nombre=effective_mes_nombre,
+                        anio=effective_year,
+                        period=effective_period,
+                        tenant=tenant_name,
+                    )
+                else:
+                    email_body_html = f"""
+                    <div style="font-family: Arial, sans-serif; color: #1e293b; max-width: 650px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 10px; background-color: #ffffff;">
+                        <div style="background-color: #0f172a; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
+                            <h2 style="color: #ffffff; margin: 0; font-size: 20px;">TKmE CLOUD - Reporte de Mapas de Calor</h2>
+                        </div>
+                        <p style="font-size: 15px; line-height: 1.5;">Estimado usuario,</p>
+                        <p style="font-size: 14px; line-height: 1.6; color: #334155;">
+                            Se ha generado exitosamente el <strong>Reporte Mensual de Mapa de Calor</strong> para el tenant <strong>{tenant_name}</strong> correspondiente al período <strong>{effective_period}</strong> ({effective_mes_nombre} {effective_year}).
+                        </p>
+                        <div style="background-color: #f8fafc; border-left: 4px solid #0284c7; padding: 12px 16px; margin: 20px 0; border-radius: 4px;">
+                            <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #475569; line-height: 1.8;">
+                                <li><strong>Tenant:</strong> {tenant_name}</li>
+                                <li><strong>Período evaluado:</strong> {effective_period} ({effective_mes_nombre} {effective_year})</li>
+                                <li><strong>Dispositivos activos evaluados:</strong> {len(active_devices)}</li>
+                                <li><strong>Total de puntos de telemetría:</strong> {total_datapoints}</li>
+                                <li><strong>Archivo adjunto:</strong> {pdf_filename} ({file_size} bytes)</li>
+                            </ul>
+                        </div>
+                        <p style="font-size: 14px; color: #334155;">
+                            Adjunto a este correo encontrará el documento PDF generado con la visualización completa.
+                        </p>
+                        <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 24px 0 16px 0;" />
+                        <p style="font-size: 12px; color: #94a3b8; margin: 0;">
+                            Generado automáticamente por ThingsBoard Super API Gateway.
+                        </p>
+                    </div>
+                    """
+
+                # 7. Despachar correo adjuntando el último archivo creado (output_pdf_path)
+                plain_smtp_password = await email_config.get_password()
+                email_delivery_data = None
+                max_email_attempts = 3
+                last_email_err = None
+                email_timeout = float(
+                    email_opts.get("timeout")
+                    or actual_payload.get("timeout")
+                    or 120.0
+                )
+
+                for email_attempt in range(1, max_email_attempts + 1):
+                    try:
+                        logger.info(
+                            f"[Heatmap Task] Enviando reporte PDF adjunto por correo (Intento {email_attempt}/{max_email_attempts}) "
+                            f"hacia '{target_to}' (Timeout: {email_timeout:.1f}s)..."
+                        )
+                        email_delivery_data = await send_email_async(
+                            to_email=target_to,
+                            subject=target_subject,
+                            html_body=email_body_html,
+                            from_email=sender,
+                            from_name=sender_name,
+                            attachment_paths=[output_pdf_path],
+                            cc=target_cc,
+                            bcc=target_bcc,
+                            host=email_config.host,
+                            port=email_config.port,
+                            username=email_config.username,
+                            password=plain_smtp_password,
+                            use_tls=email_config.use_tls,
+                            timeout=email_timeout,
+                        )
+                        email_sent_status = True
+                        logger.info(f"[Heatmap Task] Reporte PDF enviado exitosamente por correo hacia '{target_to}'.")
+                        break
+                    except (aiosmtplib.errors.SMTPReadTimeoutError, aiosmtplib.errors.SMTPServerDisconnected, TimeoutError) as net_err:
+                        last_email_err = net_err
+                        logger.warning(
+                            f"[Heatmap Task] Fallo transitorio de red/timeout enviando correo (Intento {email_attempt}/{max_email_attempts}): {net_err}. "
+                            f"Reintentando en {2 ** email_attempt}s..."
+                        )
+                        if email_attempt < max_email_attempts:
+                            await asyncio.sleep(2 ** email_attempt)
+                    except Exception as err:
+                        last_email_err = err
+                        break
+
+                if not email_sent_status and last_email_err:
+                    raise last_email_err
+            except Exception as email_err:
+                email_sent_status = False
+                email_delivery_data = {
+                    "status": "FAILED",
+                    "error": str(email_err),
+                    "error_type": type(email_err).__name__,
+                    "target_to": target_to if "target_to" in locals() else None,
+                }
+                logger.error(
+                    f"[Heatmap Task] Falló el envío de correo para tarea {job_id}: {email_err}. "
+                    f"El reporte PDF fue generado y catalogado exitosamente ({pdf_filename}).",
+                    exc_info=True
+                )
+
+
+        # 11. Finalización exitosa
         await publish_task_status(
             redis_client=redis_conn,
             user_id=user_id,
@@ -854,7 +1229,8 @@ async def generate_monthly_heatmap_task(
             tenant_name=tenant_name,
             progress_pct=100.0,
             total_records=total_datapoints,
-            cleanup_on_terminal=True
+            cleanup_on_terminal=True,
+            task_type="heatmap"
         )
 
         return {
@@ -866,7 +1242,9 @@ async def generate_monthly_heatmap_task(
             "file_size_bytes": file_size,
             "active_devices_count": len(active_devices),
             "total_datapoints": total_datapoints,
-            "period": period_label
+            "period": period_label,
+            "email_sent": email_sent_status,
+            "email_delivery": email_delivery_data
         }
 
     except Exception as exc:
@@ -880,7 +1258,8 @@ async def generate_monthly_heatmap_task(
                 tenant_name=tenant_name,
                 progress_pct=0.0,
                 total_records=0,
-                cleanup_on_terminal=True
+                cleanup_on_terminal=True,
+                task_type="heatmap"
             )
         except Exception:
             pass
@@ -1249,10 +1628,13 @@ async def collect_servers_system_info_task(
 
 async def send_email_task(
     ctx: dict,
-    to_email: Optional[str] = None,
+    to_email: Optional[Union[str, list[str]]] = None,
     subject: Optional[str] = None,
     html_body: Optional[str] = None,
     text_body: Optional[str] = None,
+    body: Optional[str] = None,
+    cc: Optional[Union[str, list[str]]] = None,
+    bcc: Optional[Union[str, list[str]]] = None,
     attachment_paths: Optional[list[str]] = None,
     payload: Optional[dict] = None,
     **kwargs
@@ -1260,33 +1642,34 @@ async def send_email_task(
     """
     Tarea asíncrona de ARQ para envío de correos electrónicos con configuración dinámica en MongoDB.
     1. Resuelve el documento TBEmailConfig activo en MongoDB y descifra su contraseña en memoria RAM.
-    2. Invoca send_email_async pasando las credenciales descifradas y rutas de archivos locales (attachment_paths).
+    2. Invoca send_email_async pasando las credenciales descifradas, CC, BCC, cuerpo y rutas locales (attachment_paths).
        Evita la saturación de memoria en Redis al pasar únicamente referencias a rutas de disco local.
     3. Maneja fallos transitorios con arq.Retry y retroceso exponencial.
     4. Bloque finally: Purga de forma asíncrona no bloqueante (asyncio.to_thread(os.remove)) los archivos temporales
-       del disco local una vez que el correo se haya enviado o haya fallado de forma definitiva.
-
-    Parámetros:
-        ctx: Contexto inyectado por el worker de ARQ (job_id, job_try, etc.).
-        to_email: Correo electrónico del destinatario.
-        subject: Asunto del mensaje.
-        html_body: Cuerpo del mensaje formateado en HTML.
-        text_body: Cuerpo opcional en texto plano para clientes sin soporte HTML.
-        attachment_paths: Lista opcional de rutas a archivos temporales en disco.
-        payload: Diccionario alternativo con argumentos.
+       del disco local una vez que el correo se haya enviado o haya fallado de forma definitiva (si delete_attachments=True).
     """
     actual_payload = payload if payload is not None else kwargs
-    target_to_email = to_email or actual_payload.get("to_email")
+    target_to_email = to_email or actual_payload.get("to_email") or actual_payload.get("to")
     target_subject = subject or actual_payload.get("subject")
+    target_body = body or actual_payload.get("body")
     target_html_body = html_body or actual_payload.get("html_body")
     target_text_body = text_body or actual_payload.get("text_body")
+    target_cc = cc or actual_payload.get("cc")
+    target_bcc = bcc or actual_payload.get("bcc")
     target_attachment_paths = (
         attachment_paths
         if attachment_paths is not None
         else actual_payload.get("attachment_paths") or []
     )
     target_config_id = actual_payload.get("config_id")
-    target_from_email = actual_payload.get("from_email")
+    target_from_email = actual_payload.get("from_email") or actual_payload.get("from")
+    target_from_name = (
+        actual_payload.get("from_name")
+        or actual_payload.get("sender_name")
+        or kwargs.get("from_name")
+        or kwargs.get("sender_name")
+    )
+    target_user_id = actual_payload.get("user_id") or kwargs.get("user_id")
     delete_attachments = actual_payload.get("delete_attachments", True)
 
     if not target_to_email:
@@ -1307,6 +1690,32 @@ async def send_email_task(
         f"(Asunto: '{target_subject}', Intento: {job_try}, Adjuntos: {len(target_attachment_paths)})"
     )
 
+    async def _publish_email_event(evt_status: str, evt_pct: float, evt_msg: str, evt_details: dict, terminal: bool = False):
+        if target_user_id:
+            try:
+                r_cli = ctx.get("redis") or redis_client
+                await publish_task_event(
+                    redis_client=r_cli,
+                    user_id=str(target_user_id),
+                    task_id=job_id,
+                    status=evt_status,
+                    task_type="email",
+                    progress_pct=evt_pct,
+                    message=evt_msg,
+                    details=evt_details,
+                    cleanup_on_terminal=terminal
+                )
+            except Exception as pe:
+                logger.debug(f"[ARQ Worker] No se pudo publicar evento de correo {job_id}: {pe}")
+
+    await _publish_email_event(
+        evt_status="PROCESSING",
+        evt_pct=10.0,
+        evt_msg=f"Iniciando envío de correo hacia '{target_to_email}' (Intento {job_try}/5)...",
+        evt_details={"to_email": target_to_email, "subject": target_subject, "attempt": job_try},
+        terminal=False
+    )
+
     try:
         # 1. Consultar configuración SMTP en MongoDB (Beanie ODM)
         email_config: Optional[TBEmailConfig] = None
@@ -1317,12 +1726,12 @@ async def send_email_task(
                 email_config = await TBEmailConfig.get(target_config_id)
 
         if not email_config:
-            # Buscar configuración activa por defecto
-            email_config = await TBEmailConfig.find_one(TBEmailConfig.is_active == True)
+            # Buscar configuración singleton activa en MongoDB
+            email_config = await TBEmailConfig.get_singleton()
 
         if not email_config:
-            # Fallback al primer registro en MongoDB
-            email_config = await TBEmailConfig.find_one()
+            # Fallback seguro con diccionario
+            email_config = await TBEmailConfig.find_one({"is_active": True})
 
         if not email_config:
             raise ValueError(
@@ -1333,8 +1742,9 @@ async def send_email_task(
         # 2. Descifrar contraseña en memoria RAM
         plain_password = await email_config.get_password()
 
-        # 3. Determinar remitente (target_from_email > sender_email > username)
+        # 3. Determinar remitente (target_from_email > sender_email > username) y nombre (target_from_name > sender_name)
         sender = target_from_email or email_config.sender_email or email_config.username
+        sender_name = target_from_name or email_config.sender_name
 
         # 4. Invocar servicio dinámico no bloqueante
         result = await send_email_async(
@@ -1342,8 +1752,12 @@ async def send_email_task(
             subject=target_subject,
             html_body=target_html_body,
             text_body=target_text_body,
+            body=target_body,
             from_email=sender,
+            from_name=sender_name,
             attachment_paths=target_attachment_paths,
+            cc=target_cc,
+            bcc=target_bcc,
             host=email_config.host,
             port=email_config.port,
             username=email_config.username,
@@ -1351,10 +1765,24 @@ async def send_email_task(
             use_tls=email_config.use_tls,
         )
         logger.info(f"[ARQ Worker] Tarea send_email_task {job_id} completada exitosamente hacia '{target_to_email}'.")
+        await _publish_email_event(
+            evt_status="SUCCESS",
+            evt_pct=100.0,
+            evt_msg=f"Correo enviado exitosamente hacia '{target_to_email}'.",
+            evt_details={"to_email": target_to_email, "subject": target_subject, "result": result},
+            terminal=True
+        )
         return result
 
     except asyncio.CancelledError:
         logger.warning(f"[ARQ Worker] Tarea send_email_task {job_id} CANCELADA por señal externa.")
+        await _publish_email_event(
+            evt_status="CANCELLED",
+            evt_pct=0.0,
+            evt_msg="Tarea de correo cancelada externamente.",
+            evt_details={"to_email": target_to_email},
+            terminal=True
+        )
         raise
     except (
         aiosmtplib.SMTPConnectTimeoutError,
@@ -1375,8 +1803,22 @@ async def send_email_task(
                 f"[ARQ Worker] Fallo transitorio de red/timeout SMTP en tarea {job_id}: {exc}. "
                 f"Reintentando en {countdown}s (Intento {job_try}/5)..."
             )
+            await _publish_email_event(
+                evt_status="RETRYING",
+                evt_pct=round(min(90.0, job_try * 18.0), 1),
+                evt_msg=f"Fallo transitorio de conexión SMTP: {exc}. Reintentando en {countdown}s (Intento {job_try}/5)...",
+                evt_details={"to_email": target_to_email, "attempt": job_try, "error": str(exc), "retry_countdown_seconds": countdown},
+                terminal=False
+            )
             raise Retry(defer=countdown)
         logger.error(f"[ARQ Worker] Agotados los reintentos (5) para enviar correo en tarea {job_id}: {exc}")
+        await _publish_email_event(
+            evt_status="FAILURE",
+            evt_pct=100.0,
+            evt_msg=f"Agotados los reintentos (5) para enviar correo hacia '{target_to_email}': {exc}",
+            evt_details={"to_email": target_to_email, "error": str(exc), "attempt": job_try},
+            terminal=True
+        )
         raise exc
     except aiosmtplib.SMTPResponseException as exc:
         # Respuestas 4xx o 503 del servidor SMTP (indisponibilidad temporal)
@@ -1387,8 +1829,22 @@ async def send_email_task(
                 f"[ARQ Worker] Error de respuesta SMTP transitorio ({exc.code}: {exc.message}) en tarea {job_id}. "
                 f"Reintentando en {countdown}s (Intento {job_try}/5)..."
             )
+            await _publish_email_event(
+                evt_status="RETRYING",
+                evt_pct=round(min(90.0, job_try * 18.0), 1),
+                evt_msg=f"Respuesta SMTP transitoria ({exc.code}). Reintentando en {countdown}s (Intento {job_try}/5)...",
+                evt_details={"to_email": target_to_email, "attempt": job_try, "error": f"{exc.code}: {exc.message}"},
+                terminal=False
+            )
             raise Retry(defer=countdown)
         logger.error(f"[ARQ Worker] Error SMTP no recuperable ({exc.code}: {exc.message}) en tarea {job_id}")
+        await _publish_email_event(
+            evt_status="FAILURE",
+            evt_pct=100.0,
+            evt_msg=f"Error SMTP no recuperable ({exc.code}: {exc.message}) al enviar hacia '{target_to_email}'",
+            evt_details={"to_email": target_to_email, "error": f"{exc.code}: {exc.message}", "attempt": job_try},
+            terminal=True
+        )
         raise exc
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in (429, 500, 502, 503, 504) and job_try <= 5:
@@ -1397,6 +1853,13 @@ async def send_email_task(
             logger.warning(
                 f"[ARQ Worker] Error HTTP transitorio ({exc.response.status_code}) en tarea {job_id}. "
                 f"Reintentando en {countdown}s (Intento {job_try}/5)..."
+            )
+            await _publish_email_event(
+                evt_status="RETRYING",
+                evt_pct=round(min(90.0, job_try * 18.0), 1),
+                evt_msg=f"Error HTTP transitorio ({exc.response.status_code}). Reintentando en {countdown}s...",
+                evt_details={"to_email": target_to_email, "attempt": job_try, "error": str(exc)},
+                terminal=False
             )
             raise Retry(defer=countdown)
         raise exc
@@ -1408,10 +1871,24 @@ async def send_email_task(
                 f"[ARQ Worker] Error de red HTTP transitorio ({exc}) en tarea {job_id}. "
                 f"Reintentando en {countdown}s (Intento {job_try}/5)..."
             )
+            await _publish_email_event(
+                evt_status="RETRYING",
+                evt_pct=round(min(90.0, job_try * 18.0), 1),
+                evt_msg=f"Error de red transitorio ({exc}). Reintentando en {countdown}s...",
+                evt_details={"to_email": target_to_email, "attempt": job_try, "error": str(exc)},
+                terminal=False
+            )
             raise Retry(defer=countdown)
         raise exc
     except Exception as exc:
         logger.error(f"[ARQ Worker] Error en send_email_task {job_id}: {exc}", exc_info=True)
+        await _publish_email_event(
+            evt_status="FAILURE",
+            evt_pct=100.0,
+            evt_msg=f"Error inesperado al enviar correo hacia '{target_to_email}': {exc}",
+            evt_details={"to_email": target_to_email, "error": str(exc), "attempt": job_try},
+            terminal=True
+        )
         raise exc
     finally:
         # Limpieza asíncrona de archivos temporales del disco tras envío exitoso o fallo definitivo
@@ -1429,6 +1906,171 @@ async def send_email_task(
                     logger.warning(
                         f"[ARQ Worker] Advertencia al eliminar archivo temporal '{file_path}' en finally: {cleanup_err}"
                     )
+
+
+async def send_telegram_alert_task(ctx: dict, payload: Optional[dict] = None, **kwargs) -> dict:
+    """
+    Tarea de fondo ARQ 100% asíncrona para el envío de alertas y notificaciones a Telegram Bot API.
+    Aplica debouncing en Redis mediante cerraduras distribuidas (SET NX EX) para mitigar tormentas de alertas y spam.
+    Maneja reintentos automáticos no bloqueantes con arq.Retry ante errores transitorios de red o límites de tasa (429, 5xx)
+    respetando el debouncer.
+    """
+    actual_payload = {**(payload or {}), **kwargs}
+    job_id = ctx.get("job_id") or actual_payload.get("task_id") or actual_payload.get("job_id") or str(uuid.uuid4())
+    job_try = ctx.get("job_try", 1)
+
+    message = actual_payload.get("message")
+    if not message:
+        logger.error(f"[ARQ Worker] Tarea {job_id} fallida: falta el parámetro obligatorio 'message'.")
+        return {
+            "sent": False,
+            "reason": "missing_message",
+            "error": "El parámetro 'message' es obligatorio para enviar una alerta a Telegram.",
+            "job_id": job_id,
+        }
+
+    alert_key = actual_payload.get("alert_key")
+    ttl_seconds = int(actual_payload.get("ttl_seconds", 300))
+    bot_token = actual_payload.get("bot_token")
+    chat_id = actual_payload.get("chat_id")
+    parse_mode = actual_payload.get("parse_mode", "HTML")
+    disable_web_page_preview = bool(actual_payload.get("disable_web_page_preview", True))
+    skip_debounce = bool(actual_payload.get("skip_debounce", False))
+
+    redis_conn = ctx.get("redis") or get_redis_client()
+    http_client = ctx.get("http_client")
+
+    logger.info(
+        f"[ARQ Worker] Ejecutando send_telegram_alert_task (Job: {job_id}, Intento: {job_try}/5, TTL: {ttl_seconds}s)"
+    )
+
+    # --------------------------------------------------------------------------
+    # Supresión Jerárquica: Capa 3 (IOTGateway) vs Capa 4 (Sensores Perimetrales)
+    # --------------------------------------------------------------------------
+    raw_layer = actual_payload.get("layer")
+    device_name = actual_payload.get("device_name")
+    tenant_id = actual_payload.get("tenant_id")
+
+    is_layer_4 = False
+    if raw_layer is not None:
+        clean_layer = str(raw_layer).strip().lower()
+        is_layer_4 = clean_layer in ("4", "capa 4", "capa4", "layer 4", "layer_4")
+
+    if is_layer_4 and device_name and tenant_id:
+        logger.info(
+            f"[ARQ Worker] Verificando supresión jerárquica para sensor '{device_name}' (Capa 4, Tenant: '{tenant_id}')..."
+        )
+        is_parent_inactive, parent_gw_name, parent_meta = await check_parent_gateway_status(
+            tenant_id=str(tenant_id),
+            device_name=str(device_name),
+            redis_conn=redis_conn,
+            http_client=http_client,
+        )
+        if is_parent_inactive:
+            logger.info(
+                f"[ARQ Worker] Alerta de sensor '{device_name}' (Capa 4) suprimida: "
+                f"IOTGateway padre '{parent_gw_name}' se encuentra inactivo."
+            )
+            return {
+                "sent": False,
+                "reason": "suppressed_by_parent_layer",
+                "device_name": device_name,
+                "layer": raw_layer,
+                "parent_gateway": parent_gw_name,
+                "parent_status": parent_meta,
+                "job_id": job_id,
+            }
+
+    try:
+        result = await dispatch_debounced_alert(
+            message=message,
+            alert_key=alert_key,
+            ttl_seconds=ttl_seconds,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            skip_debounce=skip_debounce,
+            redis_conn=redis_conn,
+            http_client=http_client,
+            raise_on_error=True,
+            release_lock_on_failure=True,
+        )
+        if result.get("sent"):
+            logger.info(
+                f"[ARQ Worker] Alerta de Telegram enviada exitosamente en tarea {job_id} "
+                f"(MsgID: {result.get('message_id')}, Hash: {result.get('alert_hash')})."
+            )
+        elif result.get("reason") == "debounced":
+            logger.info(
+                f"[ARQ Worker] Alerta descartada por debouncer anti-spam en tarea {job_id} "
+                f"(Hash: {result.get('alert_hash')})."
+            )
+        elif result.get("reason") == "missing_credentials":
+            logger.warning(
+                f"[ARQ Worker] Alerta de Telegram omitida en tarea {job_id}: credenciales no configuradas."
+            )
+
+        return result
+
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (429, 500, 502, 503, 504) and job_try <= 5:
+            # Respetar cabecera Retry-After de Telegram si está disponible
+            retry_after = exc.response.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                countdown = int(retry_after)
+            else:
+                countdown = 2 ** min(job_try, 5)
+
+            logger.warning(
+                f"[ARQ Worker] Error HTTP transitorio ({status}) al enviar alerta Telegram en tarea {job_id}. "
+                f"Reintentando en {countdown}s (Intento {job_try}/5)..."
+            )
+            raise Retry(defer=countdown)
+
+        logger.error(
+            f"[ARQ Worker] Error HTTP no recuperable ({status}) en send_telegram_alert_task {job_id}: {exc}"
+        )
+        return {
+            "sent": False,
+            "reason": "http_error",
+            "status_code": status,
+            "error": str(exc),
+            "job_id": job_id,
+            "job_try": job_try,
+        }
+
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        if job_try <= 5:
+            countdown = 2 ** min(job_try, 5)
+            logger.warning(
+                f"[ARQ Worker] Error de red transitorio ({type(exc).__name__}: {exc}) en send_telegram_alert_task {job_id}. "
+                f"Reintentando en {countdown}s (Intento {job_try}/5)..."
+            )
+            raise Retry(defer=countdown)
+
+        logger.error(f"[ARQ Worker] Error de red agotó los reintentos en tarea {job_id}: {exc}")
+        return {
+            "sent": False,
+            "reason": "network_error",
+            "error": str(exc),
+            "job_id": job_id,
+            "job_try": job_try,
+        }
+
+    except Exception as exc:
+        logger.error(
+            f"[ARQ Worker] Error inesperado en send_telegram_alert_task {job_id}: {exc}",
+            exc_info=True,
+        )
+        return {
+            "sent": False,
+            "reason": "internal_error",
+            "error": str(exc),
+            "job_id": job_id,
+            "job_try": job_try,
+        }
 
 
 

@@ -111,6 +111,21 @@ async def get_current_active_superuser(current_user: User = Depends(get_current_
     return current_user
 
 
+async def require_superadmin(current_user: User = Depends(get_current_user)) -> User:
+    """
+    Dependencia que asegura de forma estricta que el usuario autenticado posee
+    privilegios de superadministrador (is_superuser=True o role='superadmin').
+    Bloquea a cualquier otro rol (admin, tenant_admin, operator, viewer, user)
+    con HTTP 403 Forbidden.
+    """
+    if not (current_user.is_superuser or current_user.role == "superadmin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas"
+        )
+    return current_user
+
+
 class CasbinAuth:
     """
     Dependencia de autorización basada en RBAC con Dominios (Tenants / Servidores) mediante PyCasbin.
@@ -119,15 +134,22 @@ class CasbinAuth:
     """
     def __init__(
         self,
-        resource: str,
-        action: str,
+        resource: Optional[str] = None,
+        action: Optional[str] = None,
         default_domain: Optional[str] = None,
-        domain_type: str = "tenant"
+        domain_type: str = "tenant",
+        *,
+        obj: Optional[str] = None,
+        act: Optional[str] = None
     ):
+        resolved_resource = resource or obj
+        resolved_action = action or act
+        if not resolved_resource or not resolved_action:
+            raise ValueError("CasbinAuth requiere especificar 'resource' (o 'obj') y 'action' (o 'act').")
         if domain_type not in ("tenant", "server"):
             raise ValueError(f"domain_type inválido: '{domain_type}'. Debe ser 'tenant' o 'server'.")
-        self.resource = resource
-        self.action = action
+        self.resource = resolved_resource
+        self.action = resolved_action
         self.default_domain = default_domain
         self.domain_type = domain_type
 
@@ -226,3 +248,13 @@ class CasbinAuth:
             )
 
         return current_user
+
+
+__all__ = [
+    "oauth2_scheme",
+    "ALLOWED_PATHS_FOR_PASSWORD_CHANGE",
+    "get_current_user",
+    "get_current_active_superuser",
+    "require_superadmin",
+    "CasbinAuth",
+]

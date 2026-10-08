@@ -1,33 +1,62 @@
 import logging
 import os
-from datetime import datetime
+from typing import Optional
 
-def setup_logger(name: str = "telemetry_downloader") -> logging.Logger:
-    logger = logging.getLogger(name)
-    
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        
-        # Crear directorio de logs si no existe
-        os.makedirs("logs", exist_ok=True)
-        
-        # Handler de archivo
-        file_handler = logging.FileHandler("logs/telemetry.log", encoding="utf-8")
-        file_handler.setLevel(logging.INFO)
-        
-        # Formato: Fecha - Nivel - Contexto - Mensaje
-        formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
-        )
-        file_handler.setFormatter(formatter)
-        
-        logger.addHandler(file_handler)
-        
-        # También agregamos a stdout para ver en consola durante desarrollo
+DEFAULT_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+DEFAULT_LOG_DIR = "logs"
+DEFAULT_LOG_FILE = os.path.join(DEFAULT_LOG_DIR, "gateway.log")
+
+_INITIALIZED_LOGGERS = set()
+
+
+def setup_logger(
+    name: str = "tb_gateway",
+    log_file: Optional[str] = DEFAULT_LOG_FILE,
+    level: int = logging.INFO
+) -> logging.Logger:
+    """
+    Configura y retorna una instancia de logging.Logger con formateador estándar
+    y handlers hacia consola y archivo. Evita handlers duplicados.
+    """
+    logger_instance = logging.getLogger(name)
+    logger_instance.setLevel(level)
+
+    if name not in _INITIALIZED_LOGGERS:
+        os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
+        formatter = logging.Formatter(DEFAULT_LOG_FORMAT)
+
+        # Stream / Console Handler
         console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
         console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-        
-    return logger
+        logger_instance.addHandler(console_handler)
 
-logger = setup_logger()
+        # File Handler si se especificó archivo
+        if log_file:
+            try:
+                file_handler = logging.FileHandler(log_file, encoding="utf-8")
+                file_handler.setLevel(level)
+                file_handler.setFormatter(formatter)
+                logger_instance.addHandler(file_handler)
+            except Exception as e:
+                logger_instance.warning(f"No se pudo inicializar FileHandler en '{log_file}': {e}")
+
+        logger_instance.propagate = False
+        _INITIALIZED_LOGGERS.add(name)
+
+    return logger_instance
+
+
+def get_logger(name: str = "tb_gateway") -> logging.Logger:
+    """
+    Factoría modular de loggers. Retorna un logger nombrado específico para cada servicio o módulo.
+    Si el logger no ha sido configurado previamente, lo inicializa con los handlers estándar.
+    """
+    if not name:
+        name = "tb_gateway"
+    return setup_logger(name=name)
+
+
+# Instancia base exportada para compatibilidad retroactiva limpia
+logger = get_logger("tb_gateway")
+

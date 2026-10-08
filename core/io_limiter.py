@@ -41,17 +41,11 @@ def get_io_semaphore() -> asyncio.Semaphore:
 
 def _sync_make_archive(base_name: str, format: str, root_dir: str, base_dir: Optional[str] = None) -> str:
     """Función síncrona para ser ejecutada en un hilo secundario mediante asyncio.to_thread."""
-    if base_dir:
-        return shutil.make_archive(
-            base_name=base_name,
-            format=format,
-            root_dir=root_dir,
-            base_dir=base_dir
-        )
     return shutil.make_archive(
         base_name=base_name,
         format=format,
-        root_dir=root_dir
+        root_dir=root_dir,
+        base_dir=base_dir
     )
 
 

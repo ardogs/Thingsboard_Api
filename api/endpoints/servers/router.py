@@ -9,8 +9,9 @@ from core.models.tb_node import TBNode
 from core.tb_client import ThingsBoardClient
 from core.redis_client import redis_client
 from core.logger import logger
-from api.deps import User, get_current_user
+from api.deps import User, get_current_user, require_superadmin
 from workers.tasks import get_server_lock_key
+from core.services.ssh_service import execute_ssh_command_on_server
 from api.endpoints.servers.schemas import (
     NodeCreateRequest,
     NodeUpdateRequest,
@@ -25,6 +26,8 @@ from api.endpoints.servers.schemas import (
     TenantUpdateRequest,
     ReportConfigRequest,
     TenantResponse,
+    SSHExecuteRequest,
+    SSHExecuteResponse,
 )
 
 router = APIRouter()
@@ -542,6 +545,47 @@ async def force_unlock_server(
         "unlocked": was_locked,
         "message": f"Candado de '{server.name}' liberado exitosamente" if was_locked else f"El servidor '{server.name}' no tenía ningún candado activo"
     }
+
+
+@router.post(
+    "/{server_id}/ssh/execute",
+    response_model=SSHExecuteResponse,
+    summary="Ejecuta un comando SSH permitido en el servidor"
+)
+async def execute_server_ssh_command(
+    server_id: str,
+    request_data: SSHExecuteRequest,
+    current_user: User = Depends(require_superadmin)
+) -> SSHExecuteResponse:
+    """
+    Ejecuta un comando SSH autorizado en el servidor ThingsBoard principal.
+    Ruta restringida estrictamente a Superadministradores (require_superadmin).
+    Las credenciales se descifran estrictamente en memoria RAM sin persistencia ni exposición en logs.
+    """
+    try:
+        obj_id = PydanticObjectId(server_id)
+        server = await TBServer.get(obj_id)
+    except Exception:
+        server = None
+
+    if not server:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Servidor ThingsBoard con ID '{server_id}' no encontrado"
+        )
+
+    logger.info(
+        f"[Server Router] Superadmin '{current_user.username}' solicitó ejecución SSH en servidor "
+        f"'{server.name}' ({server_id}): '{request_data.command}'"
+    )
+
+    result = await execute_ssh_command_on_server(
+        server=server,
+        command=request_data.command,
+        timeout_seconds=request_data.timeout_seconds
+    )
+
+    return SSHExecuteResponse(**result)
 
 
 # ==========================================

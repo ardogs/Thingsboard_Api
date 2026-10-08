@@ -14,7 +14,8 @@ import matplotlib
 matplotlib.use("Agg")  # Forzar backend headless sin interfaz gráfica
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from PIL import Image as PILImage
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from PIL import Image as PILImage, ImageDraw
 
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.platypus import (
@@ -24,6 +25,60 @@ from reportlab.platypus import (
 )
 
 from core.logger import logger
+
+
+def ensure_tkme_logo_badge() -> Optional[str]:
+    """
+    Garantiza la existencia del badge con fondo oscuro y logo TKmE CLOUD para el encabezado.
+    Replica exactamente el diseño visual del badge del login (fondo oscuro #0f1117 y borde #1e293b).
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assets_dir = os.path.join(base_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    badge_path = os.path.join(assets_dir, "tkme_logo_badge.png")
+
+    if os.path.exists(badge_path):
+        return badge_path
+
+    candidate_sources = [
+        os.path.join(assets_dir, "logo.webp"),
+        os.path.abspath(os.path.join(base_dir, "..", "ThingsboardApiGateway-front", "src", "renderer", "src", "assets", "logo.webp")),
+        os.path.abspath(os.path.join(base_dir, "..", "ThingsboardApiGateway-front", "resources", "icon.png"))
+    ]
+
+    source_found = None
+    for src in candidate_sources:
+        if os.path.exists(src):
+            source_found = src
+            break
+
+    if not source_found:
+        return None
+
+    try:
+        logo = PILImage.open(source_found).convert("RGBA")
+        badge_size = 200
+        badge = PILImage.new("RGBA", (badge_size, badge_size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(badge)
+        draw.rounded_rectangle(
+            [(4, 4), (badge_size - 5, badge_size - 5)],
+            radius=40,
+            fill=(15, 17, 23, 255),
+            outline=(30, 41, 59, 255),
+            width=4
+        )
+        target_w = 140
+        ratio = target_w / float(logo.width)
+        target_h = int(logo.height * ratio)
+        logo_resized = logo.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+        pos_x = (badge_size - target_w) // 2
+        pos_y = (badge_size - target_h) // 2
+        badge.paste(logo_resized, (pos_x, pos_y), logo_resized)
+        badge.save(badge_path)
+        return badge_path
+    except Exception as e:
+        logger.warning(f"No se pudo generar badge de logo TKmE: {e}")
+        return None
 
 
 # ==============================================================================
@@ -249,20 +304,24 @@ def _render_single_heatmap_image(
     matrix_data: list,
     rules: List[HeatmapRule],
     output_image_path: str,
-    title: str = "Reporte mensual | mapas de calor",
+    title: str = "Reporte mensual mapas de calor",
     metric_name: str = "MÉTRICA",
     device_name: Optional[str] = None,
     col_labels: Optional[List[str]] = None,
     row_labels: Optional[List[str]] = None,
-    na_color: str = "#5C2D91"
+    na_color: str = "#5C2D91",
+    page_num: int = 1,
+    total_pages: int = 1,
+    logo_path: Optional[str] = None
 ) -> Tuple[str, Tuple[int, int]]:
     """
     Genera la imagen PNG del heatmap con celdas redondeadas tipo píldora (Pill Tiles).
-    Replica visualmente de manera exacta el diseño de la referencia de ThingsBoard:
-    - Eje X: 24 horas (00:00 a 23:00) con cabecera 'DÍA' en esquina superior izquierda.
-    - Eje Y: Días del mes (Día 1 a Día 30/31).
-    - Celdas con bordes redondeados, borde blanco y tipografía contrastante.
-    - Celdas 'NA' con color púrpura (#5C2D91) y texto en blanco.
+    Cumple con los requisitos de diseño para ThingsBoard Super API Gateway:
+    - Encabezado: Logo TKmE CLOUD con fondo oscuro (estilo login) a la izquierda, título al lado,
+      y DISPOSITIVO | MÉTRICA a la derecha.
+    - Mapa de calor: Centrado vertical y horizontalmente en la página con relación Letter Landscape.
+    - Leyenda: Ubicada directamente debajo del heatmap, centrada horizontalmente, explicando cada regla de color y NA.
+    - Pie de página: Número de página 'pagina {n} de {m}' en la esquina inferior derecha.
     """
     num_rows = len(matrix_data)
     num_cols = len(matrix_data[0]) if num_rows > 0 else 24
@@ -285,21 +344,50 @@ def _render_single_heatmap_image(
     # Reglas ordenadas para evaluación en cascada
     eval_rules = sort_rules_for_evaluation(rules)
 
-    cell_w = 1.0
-    cell_h = 0.65
-    gap = 0.08
-    corner_rad = 0.12
+    # Dimensionamiento dinámico para maximizar el tamaño y legibilidad del mapa de calor en Letter Landscape
+    desired_grid_w = 34.5
+    gap = 0.08 if num_cols <= 24 else 0.06
+    cell_w = max(0.85, (desired_grid_w / max(1, num_cols)) - gap)
+    cell_h = max(0.55, min(0.70, cell_w * 0.52))
+    corner_rad = min(0.14, cell_h * 0.22)
 
     total_w = num_cols * (cell_w + gap)
     total_h = num_rows * (cell_h + gap)
 
-    fig_w = max(18.0, total_w + 3.2)
-    fig_h = max(7.0, total_h * 0.55 + 2.8)
+    # Ancho total ocupado por el grid + etiquetas de fila (las etiquetas van de x = -1.6 a 0)
+    grid_left = -1.6
+    grid_right = total_w
+    grid_center_x = (grid_left + grid_right) / 2.0
+    grid_center_y = total_h / 2.0
 
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=160)
+    # Margen horizontal simétrico a los lados del grid
+    side_margin = 1.6
+    needed_span_x = (grid_right - grid_left) + (side_margin * 2.0)
+
+    # Espacio vertical necesario para encabezado superior, separación nítida, leyenda y pie de página
+    top_space = 3.6
+    bottom_space = 2.9
+    needed_span_y = total_h + top_space + bottom_space
+
+    # Relación de aspecto estándar Letter Landscape (11 x 8.5)
+    page_ratio = 11.0 / 8.5
+    target_span_x = max(needed_span_x, needed_span_y * page_ratio)
+    target_span_y = target_span_x / page_ratio
+
+    if target_span_y < needed_span_y:
+        target_span_y = needed_span_y
+        target_span_x = target_span_y * page_ratio
+
+    fig_w = 28.0
+    fig_h = fig_w / page_ratio
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=100)
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#ffffff")
 
+    cell_fontsize = 9.5 if cell_w >= 1.2 else 8.5
+
+    # 1. Dibujar celdas del heatmap
     for r_idx in range(num_rows):
         y = (num_rows - 1 - r_idx) * (cell_h + gap)
         row_vals = matrix_data[r_idx]
@@ -353,43 +441,98 @@ def _render_single_heatmap_image(
                 y + cell_h / 2.0,
                 cell_text,
                 color=text_color,
-                fontsize=8.5,
+                fontsize=cell_fontsize,
                 fontweight="bold",
                 ha="center",
                 va="center"
             )
 
-    ax.set_xlim(-1.6, total_w + 0.5)
-    ax.set_ylim(-0.8, total_h + 1.6)
-
-    # Cabecera de columnas y esquina
-    header_y = total_h + 0.35
+    # Cabecera de columnas y esquina DÍA
+    header_y = total_h + 0.38
     ax.text(-0.8, header_y, corner_label, color="#64748b", fontsize=9.5, fontweight="bold", ha="center", va="center")
     for c_idx in range(num_cols):
         x = c_idx * (cell_w + gap) + cell_w / 2.0
-        ax.text(x, header_y, str(col_labels[c_idx]), color="#64748b", fontsize=9, fontweight="medium", ha="center", va="center")
+        ax.text(x, header_y, str(col_labels[c_idx]), color="#64748b", fontsize=9.0, fontweight="normal", ha="center", va="center")
 
-    # Etiquetas de filas
+    # Etiquetas de filas (Día 1 ... Día N)
     for r_idx in range(num_rows):
         y = (num_rows - 1 - r_idx) * (cell_h + gap) + cell_h / 2.0
-        ax.text(-0.8, y, str(row_labels[r_idx]), color="#64748b", fontsize=9, fontweight="medium", ha="center", va="center")
+        ax.text(-0.8, y, str(row_labels[r_idx]), color="#64748b", fontsize=9.0, fontweight="normal", ha="center", va="center")
 
-    # Título superior izquierdo
-    title_y = total_h + 1.25
-    ax.text(0.0, title_y, title, color="#1e293b", fontsize=16, fontweight="bold", ha="left", va="center")
+    # 2. Leyenda con significado de cada color directamente debajo del heatmap
+    legend_items = []
+    for rule in eval_rules:
+        legend_items.append((rule.color, rule.label))
+    legend_items.append((na_color, "Sin datos (NA)"))
 
-    # Encabezado superior derecho: DISPOSITIVO | MÉTRICA
+    item_widths = [1.0 + 0.3 + len(label) * 0.18 + 1.2 for _, label in legend_items]
+    total_legend_w = sum(item_widths) - 1.2
+    leg_start_x = grid_center_x - (total_legend_w / 2.0)
+    legend_y = -1.25
+
+    curr_lx = leg_start_x
+    for idx, (l_color, l_label) in enumerate(legend_items):
+        swatch = patches.FancyBboxPatch(
+            (curr_lx, legend_y - 0.20),
+            0.9,
+            0.42,
+            boxstyle="round,pad=0,rounding_size=0.10",
+            facecolor=l_color,
+            edgecolor="#ffffff",
+            linewidth=1.0
+        )
+        ax.add_patch(swatch)
+        ax.text(curr_lx + 1.1, legend_y, l_label, color="#334155", fontsize=10.0, fontweight="bold", ha="left", va="center")
+        curr_lx += item_widths[idx]
+
+    # Límites del lienzo para centrado perfecto en Letter Landscape (11 x 8.5)
+    ax.set_xlim(grid_center_x - target_span_x / 2.0, grid_center_x + target_span_x / 2.0)
+    ax.set_ylim(grid_center_y - target_span_y / 2.0, grid_center_y + target_span_y / 2.0)
+
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+
+    # 3. Encabezado superior con separación horizontal generosa entre Logo y Título
+    y_header = y_max - 1.6
+    badge_file = logo_path or ensure_tkme_logo_badge()
+
+    if badge_file and os.path.exists(badge_file):
+        try:
+            badge_im = PILImage.open(badge_file)
+            imagebox = OffsetImage(badge_im, zoom=0.38)
+            ab = AnnotationBbox(imagebox, (x_min + 1.8, y_header), frameon=False, box_alignment=(0.0, 0.5))
+            ax.add_artist(ab)
+            # Separación horizontal evidente entre el logo y el título
+            title_x = x_min + 4.8
+        except Exception as img_err:
+            logger.warning(f"Error renderizando logo badge en heatmap: {img_err}")
+            title_x = x_min + 1.8
+    else:
+        title_x = x_min + 1.8
+
+    # Título con mayor jerarquía visual (fontsize 19.0, bold, #0f172a)
+    ax.text(title_x, y_header, title, color="#0f172a", fontsize=19.0, fontweight="bold", ha="left", va="center")
+
+    # Encabezado superior derecho: DISPOSITIVO | MÉTRICA (fontsize 13.5, bold, #334155)
     clean_metric = metric_name if metric_name.upper().startswith("MÉTRICA") else f"MÉTRICA: {metric_name}"
     if device_name and device_name.strip():
         right_header = f"DISPOSITIVO: {device_name.strip()}   |   {clean_metric}"
     else:
         right_header = clean_metric
-    ax.text(total_w - gap, title_y, right_header, color="#475569", fontsize=13, fontweight="bold", ha="right", va="center")
+    ax.text(x_max - 1.8, y_header, right_header, color="#334155", fontsize=13.5, fontweight="bold", ha="right", va="center")
+
+    # Línea divisoria sutil bajo el encabezado
+    y_divider = y_header - 0.85
+    ax.plot([x_min + 1.8, x_max - 1.8], [y_divider, y_divider], color="#cbd5e1", linewidth=1.3)
+
+    # 4. Pie de página al fondo y a la derecha: 'pagina {n} de {m}'
+    footer_y = y_min + 0.7
+    ax.text(x_max - 1.8, footer_y, f"pagina {page_num} de {total_pages}", color="#64748b", fontsize=10.0, fontweight="normal", ha="right", va="center")
 
     ax.axis("off")
-    plt.tight_layout(pad=1.0)
+    plt.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
     os.makedirs(os.path.dirname(output_image_path), exist_ok=True)
-    plt.savefig(output_image_path, facecolor=fig.get_facecolor(), edgecolor="none", dpi=160, bbox_inches="tight")
+    plt.savefig(output_image_path, facecolor=fig.get_facecolor(), edgecolor="none", dpi=100, bbox_inches="tight", pad_inches=0.25)
 
     with PILImage.open(output_image_path) as im:
         img_size = im.size
@@ -492,6 +635,7 @@ def _sync_generate_heatmap_pdf(
             raise ValueError("No se proporcionaron datos de mapas de calor para generar el reporte.")
 
         rendered_pages: List[Tuple[str, int, int]] = []
+        total_pages = len(heatmap_items)
 
         # 2. Renderizar cada mapa de calor individual en imagen temporal
         base_no_ext = os.path.splitext(output_pdf_path)[0]
@@ -504,8 +648,9 @@ def _sync_generate_heatmap_pdf(
             item_title = item.get("title") or title
             item_col_labels = item.get("col_labels")
             item_row_labels = item.get("row_labels")
+            page_num = idx + 1
 
-            temp_img = f"{base_no_ext}_chart_p{idx+1}.png"
+            temp_img = f"{base_no_ext}_chart_p{page_num}.png"
             temp_images_created.append(temp_img)
 
             _, (w, h) = _render_single_heatmap_image(
@@ -516,7 +661,9 @@ def _sync_generate_heatmap_pdf(
                 metric_name=item_metric,
                 device_name=item_device,
                 col_labels=item_col_labels,
-                row_labels=item_row_labels
+                row_labels=item_row_labels,
+                page_num=page_num,
+                total_pages=total_pages
             )
             rendered_pages.append((temp_img, w, h))
 
@@ -524,10 +671,10 @@ def _sync_generate_heatmap_pdf(
         doc = SimpleDocTemplate(
             output_pdf_path,
             pagesize=landscape(letter),
-            leftMargin=20,
-            rightMargin=20,
-            topMargin=20,
-            bottomMargin=20
+            leftMargin=15,
+            rightMargin=15,
+            topMargin=15,
+            bottomMargin=15
         )
 
         story = []
@@ -535,8 +682,9 @@ def _sync_generate_heatmap_pdf(
             if p_idx > 0:
                 story.append(PageBreak())
 
-            avail_w = doc.width
-            avail_h = doc.height
+            # Márgenes de seguridad para evitar desbordamiento en frames secundarios de ReportLab
+            avail_w = doc.width - 10
+            avail_h = doc.height - 20
 
             scale_w = avail_w / float(orig_w)
             scale_h = avail_h / float(orig_h)
@@ -616,3 +764,202 @@ async def generate_heatmap_report_pdf(
         )
 
     return result_pdf_path
+
+
+def interpolate_heatmap_placeholders(
+    text: Optional[str],
+    mes_nombre: str,
+    anio: Union[int, str],
+    period: str,
+    tenant: str
+) -> Optional[str]:
+    """
+    Interpola variables dinámicas en el asunto o cuerpo de los correos de mapa de calor.
+    Soporta:
+      - {mes año}, {mes ano}, {mes_año}, {mes_ano} -> 'Agosto 2026'
+      - {month year}, {month_year} -> 'Agosto 2026'
+      - {mes}, {month} -> 'Agosto'
+      - {año}, {ano}, {year} -> '2026'
+      - {periodo}, {period} -> '2026-08'
+      - {tenant}, {tenant_name} -> Nombre del Tenant
+    """
+    if not text:
+        return text
+
+    mes_ano = f"{mes_nombre} {anio}"
+
+    # Reemplazo de mes y año juntos (más específico primero)
+    res = re.sub(r'\{mes[\s_]+a[ñn]o\}', mes_ano, text, flags=re.IGNORECASE)
+    res = re.sub(r'\{month[\s_]+year\}', mes_ano, res, flags=re.IGNORECASE)
+
+    # Reemplazos individuales de mes y año
+    res = re.sub(r'\{mes\}', mes_nombre, res, flags=re.IGNORECASE)
+    res = re.sub(r'\{month\}', mes_nombre, res, flags=re.IGNORECASE)
+    res = re.sub(r'\{a[ñn]o\}', str(anio), res, flags=re.IGNORECASE)
+    res = re.sub(r'\{year\}', str(anio), res, flags=re.IGNORECASE)
+
+    # Reemplazo de período y tenant
+    res = re.sub(r'\{period(?:o)?\}', period, res, flags=re.IGNORECASE)
+    res = re.sub(r'\{tenant(?:_name)?\}', tenant, res, flags=re.IGNORECASE)
+
+    return res
+
+
+def extract_heatmap_whitelist_and_config(
+    heatmap_config: Any,
+    actual_payload: Dict[str, Any],
+    default_timezone: str = "America/Mexico_City"
+) -> Tuple[List[str], list, str, str, Optional[Any], Optional[Any]]:
+    """
+    Extrae y sanitiza la lista blanca de variables, reglas y parámetros temporales
+    a partir de custom_metadata.heatmap_config y del payload de la petición.
+    """
+    canonical_candidates = ("keys", "variables", "whitelist", "telemetry_keys", "allowed_keys", "default")
+    reserved_keys = {
+        "rules", "time_zone", "aggregation", "year", "month",
+        "period", "send_email", "email_options", "email_enabled",
+        "from_email", "from_name", "sender_name", "to_email", "recipient",
+        "subject", "email_subject", "cc", "email_cc", "bcc", "email_bcc",
+        "body", "email_body", "html_body", "timeout", "title", "subtitle",
+        "keys", "variables", "whitelist", "telemetry_keys", "allowed_keys", "default"
+    }
+
+    whitelist_keys: List[str] = []
+    rules = []
+    time_zone_str = actual_payload.get("time_zone") or default_timezone
+    agg_func = "AVG"
+    raw_year = actual_payload.get("year")
+    raw_month = actual_payload.get("month")
+
+    if isinstance(heatmap_config, list):
+        whitelist_keys = [
+            str(k).strip() for k in heatmap_config
+            if not isinstance(k, bool) and isinstance(k, (str, int, float)) and str(k).strip()
+        ]
+        rules = actual_payload.get("rules") or []
+    elif isinstance(heatmap_config, str):
+        whitelist_keys = [str(k).strip() for k in heatmap_config.split(",") if str(k).strip()]
+        rules = actual_payload.get("rules") or []
+    elif isinstance(heatmap_config, dict):
+        canonical_found = False
+        raw_keys = None
+        for cand in canonical_candidates:
+            if cand in heatmap_config:
+                raw_keys = heatmap_config[cand]
+                canonical_found = True
+                break
+
+        if canonical_found:
+            if raw_keys is not None:
+                if isinstance(raw_keys, list):
+                    whitelist_keys = [
+                        str(k).strip() for k in raw_keys
+                        if not isinstance(k, bool) and isinstance(k, (str, int, float)) and str(k).strip()
+                    ]
+                elif isinstance(raw_keys, str):
+                    whitelist_keys = [str(k).strip() for k in raw_keys.split(",") if str(k).strip()]
+                elif isinstance(raw_keys, dict):
+                    whitelist_keys = [str(k).strip() for k in raw_keys.keys() if str(k).strip()]
+                elif not isinstance(raw_keys, bool) and isinstance(raw_keys, (int, float)):
+                    whitelist_keys = [str(raw_keys).strip()]
+                else:
+                    whitelist_keys = []
+            else:
+                whitelist_keys = []
+        else:
+            whitelist_keys = [
+                str(k).strip() for k in heatmap_config.keys()
+                if k not in reserved_keys and str(k).strip()
+            ]
+
+        rules = heatmap_config.get("rules") or actual_payload.get("rules") or []
+        time_zone_str = (
+            heatmap_config.get("time_zone")
+            or actual_payload.get("time_zone")
+            or default_timezone
+        )
+        agg_func = str(heatmap_config.get("aggregation", "AVG")).strip().upper()
+        raw_year = actual_payload.get("year") or heatmap_config.get("year")
+        raw_month = actual_payload.get("month") or heatmap_config.get("month")
+    else:
+        whitelist_keys = []
+        rules = actual_payload.get("rules") or []
+
+    # Limpieza y desduplicación preservando orden
+    cleaned_whitelist: List[str] = []
+    for k in whitelist_keys:
+        if "," in k:
+            for sub_k in k.split(","):
+                sub_clean = sub_k.strip()
+                if sub_clean and sub_clean not in cleaned_whitelist:
+                    cleaned_whitelist.append(sub_clean)
+        else:
+            clean_k = k.strip()
+            if clean_k and clean_k not in cleaned_whitelist:
+                cleaned_whitelist.append(clean_k)
+
+    return cleaned_whitelist, rules, time_zone_str, agg_func, raw_year, raw_month
+
+
+def build_or_normalize_heatmap_matrix(
+    points: List[dict],
+    last_day: int,
+    agg_func: str,
+    tz: Any,
+    existing_matrix: Optional[List[List[Any]]] = None
+) -> List[List[Any]]:
+    """
+    Normaliza una matriz precalculada a dimensiones (last_day x 24) con relleno 'NA'
+    o agrega puntos de telemetría por día y hora según la función de agregación especificada.
+    """
+    if existing_matrix is not None:
+        matrix_data = [list(r) if isinstance(r, (tuple, list)) else [r] for r in existing_matrix]
+        while len(matrix_data) < last_day:
+            matrix_data.append(["NA"] * 24)
+        if len(matrix_data) > last_day:
+            matrix_data = matrix_data[:last_day]
+        for r_idx in range(len(matrix_data)):
+            row = matrix_data[r_idx]
+            while len(row) < 24:
+                row.append("NA")
+            if len(row) > 24:
+                row = row[:24]
+            matrix_data[r_idx] = row
+        return matrix_data
+
+    hourly_buckets: List[List[List[float]]] = [[[] for _ in range(24)] for _ in range(last_day)]
+    for pt in points:
+        if not isinstance(pt, dict):
+            continue
+        ts = pt.get("ts")
+        val = pt.get("value")
+        if ts is not None and val is not None:
+            try:
+                num_v = float(val)
+                pt_dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(tz)
+                if 1 <= pt_dt.day <= last_day and 0 <= pt_dt.hour < 24:
+                    hourly_buckets[pt_dt.day - 1][pt_dt.hour].append(num_v)
+            except (ValueError, TypeError):
+                pass
+
+    result_matrix = []
+    for d_idx in range(last_day):
+        row = []
+        for h_idx in range(24):
+            b = hourly_buckets[d_idx][h_idx]
+            if not b:
+                row.append("NA")
+            elif agg_func == "MAX":
+                row.append(round(max(b), 2))
+            elif agg_func == "MIN":
+                row.append(round(min(b), 2))
+            elif agg_func == "SUM":
+                row.append(round(sum(b), 2))
+            elif agg_func == "LAST":
+                row.append(round(b[-1], 2))
+            else:  # Default: AVG
+                row.append(round(sum(b) / len(b), 2))
+        result_matrix.append(row)
+
+    return result_matrix
+

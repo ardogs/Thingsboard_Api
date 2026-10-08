@@ -174,16 +174,51 @@ class ThingsBoardClient:
             response.raise_for_status()
             return response.json()
 
-    async def get_device_by_id(self, device_id: str, token: Optional[str] = None) -> dict | None:
+    async def get_device_by_id(
+        self,
+        device_id: str,
+        token: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None
+    ) -> dict | None:
         tok = self._resolve_token(token)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(
-                f"{self.base_url}/api/device/{device_id}",
-                headers={"X-Authorization": f"Bearer {tok}"}
-            )
+        url = f"{self.base_url}/api/device/{device_id}"
+        headers = {"X-Authorization": f"Bearer {tok}"}
+        if client is not None:
+            response = await client.get(url, headers=headers)
             if response.status_code == 200:
                 return response.json()
             return None
+        else:
+            async with httpx.AsyncClient(timeout=self.timeout) as ac:
+                response = await ac.get(url, headers=headers)
+                if response.status_code == 200:
+                    return response.json()
+                return None
+
+    async def get_device_by_name(
+        self,
+        device_name: str,
+        token: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None
+    ) -> dict | None:
+        """
+        Obtiene un dispositivo por su nombre exacto en ThingsBoard mediante GET /api/tenant/devices?deviceName={device_name}.
+        """
+        tok = self._resolve_token(token)
+        url = f"{self.base_url}/api/tenant/devices"
+        headers = {"X-Authorization": f"Bearer {tok}"}
+        params = {"deviceName": device_name}
+        if client is not None:
+            response = await client.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        else:
+            async with httpx.AsyncClient(timeout=self.timeout) as ac:
+                response = await ac.get(url, headers=headers, params=params)
+                if response.status_code == 200:
+                    return response.json()
+                return None
 
     async def create_device(
         self,
@@ -250,7 +285,8 @@ class ThingsBoardClient:
         scope: Optional[str] = "SERVER_SCOPE",
         keys: Optional[str] = None,
         entity_type: str = "DEVICE",
-        token: Optional[str] = None
+        token: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None
     ) -> list[dict]:
         """
         Obtiene los atributos de una entidad en ThingsBoard.
@@ -266,16 +302,20 @@ class ThingsBoardClient:
         if keys:
             params["keys"] = keys
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(
-                url,
-                headers={"X-Authorization": f"Bearer {tok}"},
-                params=params
-            )
+        headers = {"X-Authorization": f"Bearer {tok}"}
+        if client is not None:
+            response = await client.get(url, headers=headers, params=params)
             if response.status_code == 200:
                 return response.json()
             response.raise_for_status()
             return []
+        else:
+            async with httpx.AsyncClient(timeout=self.timeout) as ac:
+                response = await ac.get(url, headers=headers, params=params)
+                if response.status_code == 200:
+                    return response.json()
+                response.raise_for_status()
+                return []
 
     async def find_entities_by_query(
         self,
@@ -317,25 +357,52 @@ class ThingsBoardClient:
 
     async def get_entity_relations(
         self,
-        from_id: str,
-        from_type: str = "ASSET",
-        token: Optional[str] = None
+        from_id: Optional[str] = None,
+        from_type: Optional[str] = "ASSET",
+        to_id: Optional[str] = None,
+        to_type: Optional[str] = None,
+        token: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None
     ) -> list[dict]:
         """
-        Obtiene las relaciones salientes de una entidad en ThingsBoard (/api/relations/info).
+        Obtiene las relaciones de una entidad en ThingsBoard (/api/relations/info).
+        Soporta relaciones salientes ("Desde": fromId, fromType) o entrantes ("Hacia": toId, toType).
+        Permite la inyección de un httpx.AsyncClient reutilizable para consultas concurrentes.
+        Lanza HTTPStatusError ante código 401 para permitir auto-renovación de token en capas superiores.
         """
         tok = self._resolve_token(token)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(
-                    f"{self.base_url}/api/relations/info",
-                    headers={"X-Authorization": f"Bearer {tok}"},
-                    params={"fromId": from_id, "fromType": from_type}
-                )
+        headers = {"X-Authorization": f"Bearer {tok}"}
+        params: Dict[str, Any] = {}
+        if from_id:
+            params["fromId"] = from_id
+            if from_type:
+                params["fromType"] = from_type
+        if to_id:
+            params["toId"] = to_id
+            if to_type:
+                params["toType"] = to_type
+
+        if not params:
+            return []
+
+        url = f"{self.base_url}/api/relations/info"
+
+        if client is not None:
+            response = await client.get(url, headers=headers, params=params)
+            if response.status_code == 401:
+                response.raise_for_status()
+            if response.status_code == 200:
+                data = response.json()
+                return data if isinstance(data, list) else []
+            return []
+        else:
+            async with httpx.AsyncClient(timeout=self.timeout) as ac:
+                response = await ac.get(url, headers=headers, params=params)
+                if response.status_code == 401:
+                    response.raise_for_status()
                 if response.status_code == 200:
-                    return response.json()
-                return []
-            except Exception:
+                    data = response.json()
+                    return data if isinstance(data, list) else []
                 return []
 
     async def get_system_info(self, token: Optional[str] = None) -> dict:

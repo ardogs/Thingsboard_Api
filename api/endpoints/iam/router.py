@@ -8,9 +8,9 @@ from core.models.tb_server import TBServer
 from core.models.tb_tenant import TBTenant
 from core.casbin_enforcer import get_casbin_enforcer
 from core.roles import RoleScope, RoleDetailResponse, get_available_roles
-from api.deps import CasbinAuth
+from api.deps import require_superadmin
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_superadmin)])
 
 
 # ==========================================
@@ -117,7 +117,7 @@ class DomainDetailResponse(BaseModel):
 
     ### 🔒 Seguridad y Permisos:
     - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
-    - Requiere permiso Casbin: recurso `iam`, acción `read`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
     """,
     responses={
         200: {
@@ -127,7 +127,7 @@ class DomainDetailResponse(BaseModel):
             "description": "No autenticado o token JWT inválido/revocado."
         },
         403: {
-            "description": "Permisos insuficientes en el IAM (requiere acción 'read' sobre recurso 'iam')."
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
         }
     }
 )
@@ -136,10 +136,11 @@ async def list_available_roles(
         default=None,
         description="Filtrar roles por ámbito de aplicación ('system', 'tenant' o 'server')"
     ),
-    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+    current_user: User = Depends(require_superadmin)
 ) -> List[RoleDetailResponse]:
     """
     Retorna la lista de roles registrados en el sistema, opcionalmente filtrados por su ámbito.
+    Requiere privilegios exclusivos de superadministrador.
     """
     return get_available_roles(scope=scope)
 
@@ -159,7 +160,7 @@ async def list_available_roles(
 
     ### 🔒 Seguridad y Permisos:
     - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
-    - Requiere permiso Casbin: recurso `iam`, acción `read`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
     """,
     responses={
         200: {
@@ -169,7 +170,7 @@ async def list_available_roles(
             "description": "No autenticado o token JWT inválido/revocado."
         },
         403: {
-            "description": "Permisos insuficientes en el IAM (requiere acción 'read' sobre recurso 'iam')."
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
         }
     }
 )
@@ -178,10 +179,11 @@ async def list_available_domains(
         default=None,
         description="Filtrar dominios por tipo ('global', 'server', 'tenant' o 'all')"
     ),
-    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+    current_user: User = Depends(require_superadmin)
 ) -> List[DomainDetailResponse]:
     """
     Retorna la lista de dominios disponibles (global, servidores y tenants) con sus URNs listos para Casbin.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     active_doms = set()
@@ -262,13 +264,39 @@ async def list_available_domains(
     return domains
 
 
-@router.post("/roles/assign")
+@router.post(
+    "/roles/assign",
+    status_code=status.HTTP_200_OK,
+    summary="Asignar rol a un usuario",
+    description="""
+    Asigna un rol a un usuario dentro de un Tenant / Servidor específico o globalmente mediante URN.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Rol asignado exitosamente o ya existente en el dominio."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        },
+        500: {
+            "description": "Error al persistir la asignación de rol en Casbin."
+        }
+    }
+)
 async def assign_role_to_user(
     request: RoleAssignRequest,
-    current_user: User = Depends(CasbinAuth(resource="iam", action="write"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Asigna un rol a un usuario dentro de un Tenant / Servidor específico o globalmente mediante URN.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     domain_urn = _build_domain_urn(request.domain, request.domain_type)
@@ -301,13 +329,36 @@ async def assign_role_to_user(
     }
 
 
-@router.post("/roles/revoke")
+@router.post(
+    "/roles/revoke",
+    status_code=status.HTTP_200_OK,
+    summary="Revocar rol de un usuario",
+    description="""
+    Revoca un rol asignado a un usuario dentro de un Tenant / Servidor específico mediante URN.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Rol revocado exitosamente o el usuario no poseía el rol en el dominio."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        }
+    }
+)
 async def revoke_role_from_user(
     request: RoleRevokeRequest,
-    current_user: User = Depends(CasbinAuth(resource="iam", action="write"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Revoca un rol asignado a un usuario dentro de un Tenant / Servidor específico mediante URN.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     domain_urn = _build_domain_urn(request.domain, request.domain_type)
@@ -329,15 +380,38 @@ async def revoke_role_from_user(
     }
 
 
-@router.get("/users/{user_id}/roles")
+@router.get(
+    "/users/{user_id}/roles",
+    status_code=status.HTTP_200_OK,
+    summary="Consultar roles de un usuario",
+    description="""
+    Retorna la lista de roles asociados a un usuario en un dominio específico (con prefijo URN) o en todos los dominios.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Roles del usuario recuperados exitosamente."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        }
+    }
+)
 async def get_user_roles(
     user_id: str,
     domain: Optional[str] = Query(default=None, description="Dominio, ID de Tenant o Servidor opcional"),
     domain_type: DomainType = Query(default=DomainType.TENANT, description="Tipo de dominio ('tenant' o 'server')"),
-    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Retorna la lista de roles asociados a un usuario en un dominio específico (con prefijo URN) o en todos los dominios.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     if domain:
@@ -354,15 +428,38 @@ async def get_user_roles(
     }
 
 
-@router.get("/roles/{role}/users")
+@router.get(
+    "/roles/{role}/users",
+    status_code=status.HTTP_200_OK,
+    summary="Consultar usuarios con un rol",
+    description="""
+    Retorna la lista de usuarios que poseen un rol determinado dentro de un Tenant / Servidor / Dominio (con prefijo URN).
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Usuarios con el rol especificado recuperados exitosamente."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        }
+    }
+)
 async def get_users_with_role(
     role: str,
     domain: str = Query(default="*", description="Dominio, ID de Tenant o Servidor ('*' para todos)"),
     domain_type: DomainType = Query(default=DomainType.TENANT, description="Tipo de dominio ('tenant' o 'server')"),
-    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Retorna la lista de usuarios que poseen un rol determinado dentro de un Tenant / Servidor / Dominio (con prefijo URN).
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     domain_urn = _build_domain_urn(domain, domain_type)
@@ -378,13 +475,39 @@ async def get_users_with_role(
 # Endpoints de Gestión de Políticas (Permissions)
 # ==========================================
 
-@router.post("/policies")
+@router.post(
+    "/policies",
+    status_code=status.HTTP_200_OK,
+    summary="Registrar regla de política Casbin",
+    description="""
+    Agrega una nueva regla de política RBAC (sub, dom, obj, act) a Casbin soportando prefijos URN.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Política registrada exitosamente o ya existente."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        },
+        500: {
+            "description": "No se pudo agregar la política en la base de datos."
+        }
+    }
+)
 async def add_policy_rule(
     request: PolicyRuleRequest,
-    current_user: User = Depends(CasbinAuth(resource="iam", action="write"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Agrega una nueva regla de política RBAC (sub, dom, obj, act) a Casbin soportando prefijos URN.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     dom = request.dom
@@ -411,13 +534,36 @@ async def add_policy_rule(
     }
 
 
-@router.delete("/policies")
+@router.delete(
+    "/policies",
+    status_code=status.HTTP_200_OK,
+    summary="Eliminar regla de política Casbin",
+    description="""
+    Elimina una regla de política RBAC (sub, dom, obj, act) de Casbin soportando prefijos URN.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Política eliminada exitosamente o no encontrada."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        }
+    }
+)
 async def remove_policy_rule(
     request: PolicyRuleRequest,
-    current_user: User = Depends(CasbinAuth(resource="iam", action="delete"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Elimina una regla de política RBAC (sub, dom, obj, act) de Casbin soportando prefijos URN.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     dom = request.dom
@@ -437,14 +583,38 @@ async def remove_policy_rule(
     }
 
 
-@router.get("/policies", response_model=List[PolicyRuleResponse])
+@router.get(
+    "/policies",
+    response_model=List[PolicyRuleResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Listar reglas de política Casbin activas",
+    description="""
+    Lista las reglas de política Casbin activas persistidas en MongoDB.
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Listado de políticas Casbin activas recuperado exitosamente."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        }
+    }
+)
 async def list_policy_rules(
     domain: Optional[str] = Query(default=None, description="Filtrar por dominio / URN (ej: tenant:123 o 123)"),
     domain_type: Optional[DomainType] = Query(default=None, description="Tipo de dominio opcional si domain no está prefijado"),
-    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Lista las reglas de política Casbin activas persistidas en MongoDB.
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     raw_policies = enforcer.get_policy()
@@ -467,13 +637,36 @@ async def list_policy_rules(
     return results
 
 
-@router.post("/enforce-check")
+@router.post(
+    "/enforce-check",
+    status_code=status.HTTP_200_OK,
+    summary="Diagnóstico de evaluación de políticas Casbin",
+    description="""
+    Endpoint de diagnóstico para evaluar si un usuario tiene acceso a un recurso y acción en un tenant o servidor (con URN).
+
+    ### 🔒 Seguridad y Permisos:
+    - Requiere token JWT en cabecera `Authorization: Bearer <token>`.
+    - Requiere privilegios exclusivos de superadministrador (is_superuser=True o role='superadmin').
+    """,
+    responses={
+        200: {
+            "description": "Diagnóstico de autorización ejecutado exitosamente."
+        },
+        401: {
+            "description": "No autenticado o token JWT inválido/revocado."
+        },
+        403: {
+            "description": "Se requieren privilegios exclusivos de superadministrador para acceder al módulo de IAM y Políticas."
+        }
+    }
+)
 async def check_enforcement(
     request: EnforceCheckRequest,
-    current_user: User = Depends(CasbinAuth(resource="iam", action="read"))
+    current_user: User = Depends(require_superadmin)
 ):
     """
     Endpoint de diagnóstico para evaluar si un usuario tiene acceso a un recurso y acción en un tenant o servidor (con URN).
+    Requiere privilegios exclusivos de superadministrador.
     """
     enforcer = get_casbin_enforcer()
     target_user_id = request.user_id or str(current_user.id)
@@ -490,3 +683,4 @@ async def check_enforcement(
         "action": request.action,
         "is_allowed": is_allowed
     }
+

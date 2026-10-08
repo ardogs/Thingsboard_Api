@@ -4,6 +4,7 @@ aiofiles==25.1.0
 aiosmtplib==5.1.2
 anyio==4.14.2
 arq==0.26.1
+asyncssh>=2.24.0
 bcrypt==5.0.0
 beanie==2.0.0
 casbin==1.43.0
@@ -11,9 +12,6 @@ casbin_motor_adapter==0.4.0
 certifi==2026.7.22
 cffi==2.1.1
 click==8.4.2
-click-didyoumean==0.3.1
-click-plugins==1.1.1.2
-click-repl==0.3.0
 colorama==0.4.6
 croniter==6.2.4
 cryptography==50.0.0
@@ -34,14 +32,12 @@ matplotlib==3.11.1
 openpyxl==3.1.5
 packaging==26.3
 pandas==3.0.5
-passlib==1.7.4
 prompt_toolkit==3.0.53
 pyasn1==0.6.4
 pycparser==3.0
 pydantic==2.13.4
 pydantic-settings==2.15.0
 pydantic_core==2.46.4
-PyJWT==2.13.0
 pymongo==4.17.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
@@ -50,11 +46,9 @@ python-multipart==0.0.32
 pytz==2026.3.post1
 redis==5.3.1
 reportlab==5.0.1
+respx>=0.23.1
 rsa==4.9.1
 seaborn==0.13.2
-sentinels==1.1.1
-simpleeval==1.0.7
-six==1.17.0
 starlette==1.6.0
 tenacity==8.3.0
 typing-inspection==0.4.4

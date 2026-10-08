@@ -70,7 +70,7 @@ def build_pagination_metadata(total: int, page: int, page_size: int) -> Paginati
     """
     total_pages = math.ceil(total / page_size) if total > 0 else 1
     has_next = page < total_pages
-    has_prev = 1 < page <= total_pages + 1
+    has_prev = 1 < page
 
     return PaginationMetadata(
         total=total,

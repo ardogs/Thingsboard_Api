@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Dict, Any
 from beanie import Document
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from core.crypto import encrypt_data, decrypt_data
 
@@ -87,6 +87,14 @@ class TBServer(Document):
     # Auditoría
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("created_at", "updated_at", mode="after")
+    @classmethod
+    def ensure_tz_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """Asegura que todas las marcas de tiempo sean offset-aware en UTC puro."""
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
     class Settings:
         name = "tb_servers"

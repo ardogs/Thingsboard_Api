@@ -38,12 +38,11 @@ def sanitize_name(name: str) -> str:
     return sanitized if sanitized else "unknown_device"
 
 
-def get_user_stream_channel(user_id: str, task_id: str) -> str:
-    return f"user:{user_id}:stream:{task_id}"
-
-
-def get_user_registry_key(user_id: str) -> str:
-    return f"tb_events:user:{user_id}:registry"
+from core.services.task_registry import (
+    get_user_stream_channel,
+    get_user_registry_key,
+    publish_task_event,
+)
 
 
 async def publish_task_status(
@@ -57,36 +56,23 @@ async def publish_task_status(
     progress_pct: float = 0.0,
     total_records: int = 0,
     records_count: Optional[int] = None,
-    cleanup_on_terminal: bool = True
+    cleanup_on_terminal: bool = True,
+    task_type: str = "telemetry"
 ) -> dict:
-    normalized_pct = max(0.0, min(100.0, round(float(progress_pct), 2)))
-    payload = {
-        "task_id": task_id,
-        "user_id": user_id,
-        "status": status,
-        "tenant_name": tenant_name,
-        "current_device": current_device,
-        "current_key": current_key,
-        "progress_pct": normalized_pct,
-        "total_records": int(total_records),
-        "records_count": records_count
-    }
-
-    payload_json = json.dumps(payload)
-    channel = get_user_stream_channel(user_id, task_id)
-    registry_key = get_user_registry_key(user_id)
-
-    try:
-        await redis_client.publish(channel, payload_json)
-        is_terminal = status in ("SUCCESS", "ERROR", "FAILURE")
-        if is_terminal and cleanup_on_terminal:
-            await redis_client.hdel(registry_key, task_id)
-        else:
-            await redis_client.hset(registry_key, task_id, payload_json)
-    except Exception as e:
-        logger.error(f"[Redis Status] Error publicando estado para tarea {task_id} (user {user_id}): {e}")
-
-    return payload
+    return await publish_task_event(
+        redis_client=redis_client,
+        user_id=user_id,
+        task_id=task_id,
+        status=status,
+        task_type=task_type,
+        progress_pct=progress_pct,
+        cleanup_on_terminal=cleanup_on_terminal,
+        tenant_name=tenant_name,
+        current_device=current_device,
+        current_key=current_key,
+        total_records=int(total_records),
+        records_count=records_count
+    )
 
 
 def publish_task_status_sync(
@@ -100,13 +86,15 @@ def publish_task_status_sync(
     total_records: int = 0,
     records_count: Optional[int] = None,
     redis_url: str = settings.REDIS_URL,
-    cleanup_on_terminal: bool = True
+    cleanup_on_terminal: bool = True,
+    task_type: str = "telemetry"
 ) -> dict:
     import redis as sync_redis
     normalized_pct = max(0.0, min(100.0, round(float(progress_pct), 2)))
     payload = {
         "task_id": task_id,
         "user_id": user_id,
+        "task_type": task_type,
         "status": status,
         "tenant_name": tenant_name,
         "current_device": current_device,
@@ -816,8 +804,17 @@ async def run_download_orchestrator(
     tz = ZoneInfo(time_zone_str)
     now_dt = datetime.now(tz)
 
-    start_dt = datetime.fromisoformat(start_date_str).replace(tzinfo=tz)
-    end_dt = datetime.fromisoformat(end_date_str).replace(tzinfo=tz)
+    def _parse_target_datetime(date_str: str, target_tz: ZoneInfo) -> datetime:
+        clean = date_str.strip()
+        if clean.endswith("Z"):
+            clean = clean[:-1] + "+00:00"
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=target_tz)
+        return dt.astimezone(target_tz)
+
+    start_dt = _parse_target_datetime(start_date_str, tz)
+    end_dt = _parse_target_datetime(end_date_str, tz)
 
     intervals = get_month_intervals(start_dt, end_dt, now_dt)
     created_local_redis = False
@@ -1067,6 +1064,7 @@ async def run_download_orchestrator(
                     task_id=task_id,
                     requested_by=user_id,
                     file_name=zip_filename_only,
+                    backup_type="telemetry",
                     start_date=start_dt,
                     end_date=end_dt,
                     file_size_bytes=file_size,

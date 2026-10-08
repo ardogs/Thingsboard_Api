@@ -1,8 +1,9 @@
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional
+from pymongo import IndexModel, ASCENDING
 from beanie import Document
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from core.crypto import encrypt_data, decrypt_data
 
@@ -15,7 +16,6 @@ class TBEmailConfig(Document):
     """
     singleton_key: str = Field(
         default="global_smtp_config",
-        unique=True,
         description="Identificador único para garantizar a nivel de base de datos que solo exista una configuración SMTP"
     )
     host: str = Field(..., description="Host o FQDN del servidor SMTP (ej: smtp.gmail.com)")
@@ -31,10 +31,18 @@ class TBEmailConfig(Document):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    @field_validator("created_at", "updated_at", mode="after")
+    @classmethod
+    def ensure_tz_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """Asegura que todas las marcas de tiempo sean offset-aware en UTC puro."""
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
     class Settings:
         name = "tb_email_configs"
         indexes = [
-            "singleton_key",
+            IndexModel([("singleton_key", ASCENDING)], unique=True),
             "username",
             "is_active"
         ]

@@ -16,6 +16,7 @@ from workers.tasks import (
     execute_incremental_tenant_backup_task,
     collect_servers_system_info_task,
     send_email_task,
+    send_telegram_alert_task,
 )
 
 
@@ -72,6 +73,8 @@ REGISTERED_FUNCTIONS = [
     func(collect_servers_system_info_task, name="tasks.collect_servers_system_info"),
     send_email_task,
     func(send_email_task, name="tasks.send_email"),
+    send_telegram_alert_task,
+    func(send_telegram_alert_task, name="tasks.send_telegram_alert"),
 ]
 
 
